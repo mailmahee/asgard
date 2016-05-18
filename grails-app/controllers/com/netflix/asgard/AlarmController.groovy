@@ -16,12 +16,13 @@
 package com.netflix.asgard
 
 import com.amazonaws.services.autoscaling.model.ScalingPolicy
+import com.amazonaws.services.cloudwatch.model.Dimension
 import com.amazonaws.services.cloudwatch.model.MetricAlarm
 import com.netflix.asgard.model.AlarmData
-import com.netflix.asgard.model.MetricId
-import com.netflix.asgard.model.TopicData
 import com.netflix.asgard.model.AlarmData.ComparisonOperator
 import com.netflix.asgard.model.AlarmData.Statistic
+import com.netflix.asgard.model.MetricId
+import com.netflix.asgard.model.TopicData
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
@@ -35,9 +36,11 @@ class AlarmController {
 
     def allowedMethods = [save: 'POST', update: 'POST', delete: 'POST']
 
-    def index = { redirect(action: 'list', params: params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         List<MetricAlarm> alarms =
                 (awsCloudWatchService.getAllAlarms(userContext) as List).sort { it.alarmName?.toLowerCase() }
@@ -49,7 +52,7 @@ class AlarmController {
         }
     }
 
-    def create = {
+    def create() {
         String policyName = params.id ?: params.policy
         UserContext userContext = UserContext.of(request)
         ScalingPolicy policy = awsAutoScalingService.getScalingPolicy(userContext, policyName)
@@ -58,11 +61,11 @@ class AlarmController {
             redirect(action: 'result')
             return
         }
-        awsCloudWatchService.prepareForAlarmCreation(userContext, policy.autoScalingGroupName, params) <<
+        awsCloudWatchService.prepareForAlarmCreation(userContext, params) <<
                 [ policy: policyName ]
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String alarmName = params.id
         MetricAlarm alarm = awsCloudWatchService.getAlarm(userContext, alarmName)
@@ -82,7 +85,7 @@ class AlarmController {
         }
     }
 
-    def edit = {
+    def edit() {
         UserContext userContext = UserContext.of(request)
         String alarmName = params.id ?: params.alarmName
         MetricAlarm alarm = awsCloudWatchService.getAlarm(userContext, alarmName)
@@ -92,11 +95,11 @@ class AlarmController {
             return
         }
         AlarmData alarmData = AlarmData.fromMetricAlarm(alarm)
-        awsCloudWatchService.prepareForAlarmCreation(userContext, alarmData.autoScalingGroupName, params, alarmData) <<
+        awsCloudWatchService.prepareForAlarmCreation(userContext, params, alarmData) <<
                 [ policy: params.policy, alarmName: alarmName ]
     }
 
-    def delete = {
+    def delete() {
         final UserContext userContext = UserContext.of(request)
         final String alarmName = params.id
         final MetricAlarm alarm = awsCloudWatchService.getAlarm(userContext, alarmName)
@@ -118,9 +121,11 @@ class AlarmController {
         redirect destination
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 
-    def save = { AlarmValidationCommand cmd ->
+    def save (AlarmValidationCommand cmd) {
         if (cmd.hasErrors()) {
             chain(action: 'create', model: [cmd: cmd], params: params)
         } else {
@@ -142,6 +147,8 @@ class AlarmController {
                     throw new IllegalStateException("Scaling Policy '${cmd.policy}' does not exist.")
             }
 
+            Map<String, String> dimensions = AlarmData.dimensionsForAsgName(policy?.autoScalingGroupName,
+                    awsCloudWatchService.getDimensionsForNamespace(metricId.namespace))
             final alarm = new AlarmData(
                     description: cmd.description,
                     comparisonOperator: comparisonOperator,
@@ -152,7 +159,7 @@ class AlarmController {
                     evaluationPeriods: cmd.evaluationPeriods,
                     threshold: cmd.threshold,
                     actionArns: snsArns,
-                    autoScalingGroupName: policy?.autoScalingGroupName
+                    dimensions: dimensions
                 )
             try {
                 String alarmName = awsCloudWatchService.createAlarm(userContext, alarm, policy.policyARN)
@@ -165,7 +172,7 @@ class AlarmController {
         }
     }
 
-    def update = { AlarmValidationCommand cmd ->
+    def update(AlarmValidationCommand cmd) {
         if (cmd.hasErrors()) {
             chain(action: 'edit', model: [cmd: cmd], params: params)
         } else {
@@ -182,6 +189,16 @@ class AlarmController {
                 period = cmd.period
                 evaluationPeriods = cmd.evaluationPeriods
                 threshold = cmd.threshold
+            }
+            awsCloudWatchService.getDimensionsForNamespace(metricId.namespace).each {
+                String name = it
+                String value = params[name]
+                if (value) {
+                    alarm.dimensions << new Dimension(name: name, value: params[name])
+                } else {
+                    Dimension removedDimension = alarm.dimensions.find { it.name == name }
+                    alarm.dimensions.remove(removedDimension)
+                }
             }
             // The topic is optional, but if it is specified then it should exist.
             TopicData topic = awsSnsService.getTopic(userContext, cmd.topic)
@@ -200,7 +217,7 @@ class AlarmController {
         }
     }
 
-    def setState = {
+    def setState() {
         String alarm = params.alarm
         String state = params.state
         UserContext userContext = UserContext.of(request)
@@ -228,6 +245,9 @@ class AlarmValidationCommand {
     String policy
 
     static constraints = {
+        existingMetric nullable: true
+        description nullable: true
+        alarmName nullable: true
         comparisonOperator(nullable: false, blank: false)
         threshold(nullable: false)
         metric(nullable: true, validator: { Object value, AlarmValidationCommand cmd ->

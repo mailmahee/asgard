@@ -18,6 +18,7 @@ package com.netflix.asgard
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.ec2.model.IpPermission
 import com.amazonaws.services.ec2.model.SecurityGroup
+import com.netflix.asgard.collections.GroupedAppRegistrationSet
 import com.netflix.asgard.model.ApplicationInstance
 import com.netflix.asgard.model.MonitorBucketType
 import com.netflix.asgard.model.Owner
@@ -35,13 +36,17 @@ class ApplicationController {
     def configService
     def discoveryService
 
-    def static allowedMethods = [save: 'POST', update: 'POST', delete: 'POST', securityUpdate: 'POST']
+    static allowedMethods = [save: 'POST', update: 'POST', delete: 'POST', securityUpdate: 'POST']
 
-    def index = { redirect(action: 'list', params: params) }
+    static editActions = ['security']
 
-    def list = {
+    def index() {
+        redirect(action: 'list', params: params)
+    }
+
+    def list() {
         UserContext userContext = UserContext.of(request)
-        List<AppRegistration> apps = applicationService.getRegisteredApplications(userContext)
+        GroupedAppRegistrationSet apps = applicationService.getGroupedRegisteredApplications(userContext)
 
         Bag groupCountsPerAppName = groupCountsPerAppName(userContext)
         Bag instanceCountsPerAppName = instanceCountsPerAppName(userContext)
@@ -52,8 +57,10 @@ class ApplicationController {
             apps = apps.findAll { AppRegistration app ->
                     app.name.toLowerCase() in lowercaseTerms ||
                     app.owner?.toLowerCase() in lowercaseTerms ||
-                    app.email?.toLowerCase() in lowercaseTerms
-            }
+                    app.email?.toLowerCase() in lowercaseTerms ||
+                    app.group?.toLowerCase() in lowercaseTerms ||
+                        (app.tags && app.tags*.toLowerCase().find { it == lowercaseTerms })
+            } as GroupedAppRegistrationSet
         }
         withFormat {
             html {
@@ -61,7 +68,7 @@ class ApplicationController {
                         applications: apps,
                         terms: terms,
                         groupCountsPerAppName: groupCountsPerAppName,
-                        instanceCountsPerAppName: instanceCountsPerAppName
+                        instanceCountsPerAppName: instanceCountsPerAppName,
                 ]
             }
             xml { new XML(apps).render(response) }
@@ -69,7 +76,7 @@ class ApplicationController {
         }
     }
 
-    def owner = {
+    def owner() {
         UserContext userContext = UserContext.of(request)
         List<AppRegistration> apps = applicationService.getRegisteredApplications(userContext)
         Bag groupCountsPerAppName = groupCountsPerAppName(userContext)
@@ -90,7 +97,7 @@ class ApplicationController {
 
         // Sort by number of instances descending, then by number of auto scaling groups descending
         List<Owner> owners = (ownerNamesToOwners.values() as List).
-                sort { -1 * it.autoScalingGroupCount}.sort { -1 * it.instanceCount }
+                sort { -1 * it.autoScalingGroupCount }.sort { -1 * it.instanceCount }
 
         withFormat {
             html { [owners: owners] }
@@ -115,7 +122,7 @@ class ApplicationController {
         instanceCountsPerAppName
     }
 
-    def show = {
+    def show() {
         String name = params.name ?: params.id
         UserContext userContext = UserContext.of(request)
         AppRegistration app = applicationService.getRegisteredApplication(userContext, name)
@@ -126,7 +133,7 @@ class ApplicationController {
                 log.debug "In show, name=${app.name} type=${app.type} description=${app.description}"
             }
             List<AutoScalingGroup> groups =
-                    awsAutoScalingService.getAutoScalingGroupsForApp(userContext, name).sort{ it.autoScalingGroupName }
+                    awsAutoScalingService.getAutoScalingGroupsForApp(userContext, name).sort { it.autoScalingGroupName }
             List<String> clusterNames =
                     groups.collect { Relationships.clusterFromGroupName(it.autoScalingGroupName) }.unique()
             request.alertingServiceConfigUrl = configService.alertingServiceConfigUrl
@@ -139,7 +146,8 @@ class ApplicationController {
                     balancers: awsLoadBalancerService.getLoadBalancersForApp(userContext, name),
                     securities: awsEc2Service.getSecurityGroupsForApp(userContext, name),
                     appSecurityGroup: appSecurityGroup,
-                    launches: awsAutoScalingService.getLaunchConfigurationsForApp(userContext, name)
+                    launches: awsAutoScalingService.getLaunchConfigurationsForApp(userContext, name),
+                    chaosMonkeyEditLink: configService.getMonkeyCommanderEditLink(app.name)
             ]
             withFormat {
                 html { return details }
@@ -152,34 +160,38 @@ class ApplicationController {
     static String[] typeList = ['Standalone Application', 'Web Application', 'Web Service']
 
     def create = {
-        ['typeList' : typeList]
+        [
+                typeList: typeList
+        ]
     }
 
-    def save = { ApplicationCreateCommand cmd ->
+    def save(ApplicationCreateCommand cmd) {
         if (cmd.hasErrors()) {
             chain(action: 'create', model: [cmd: cmd], params: params)
         } else {
             String name = params.name
             UserContext userContext = UserContext.of(request)
+            String group = params.group
             String type = params.type
             String desc = params.description
             String owner = params.owner
             String email = params.email
             String monitorBucketTypeString = params.monitorBucketType
-            try {
-                MonitorBucketType bucketType = Enum.valueOf(MonitorBucketType, monitorBucketTypeString)
-                applicationService.createRegisteredApplication(userContext, name, type, desc, owner, email,
-                        bucketType)
-                flash.message = "Application '${name}' has been created."
+            String tags = normalizeTagDelimiter(params.tags)
+            MonitorBucketType bucketType = Enum.valueOf(MonitorBucketType, monitorBucketTypeString)
+            def result = applicationService.createRegisteredApplication(
+                userContext, name, group, type, desc, owner, email, bucketType, tags
+            )
+            flash.message = result.toString()
+            if (result.succeeded()) {
                 redirect(action: 'show', params: [id: name])
-            } catch (Exception e) {
-                flash.message = "Could not create Application: ${e}"
-                chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass errors and params
+            } else {
+                chain(action: 'create', model: [cmd: cmd], params: params)
             }
         }
     }
 
-    def edit = {
+    def edit() {
         UserContext userContext = UserContext.of(request)
         String name = params.name ?: params.id
         log.debug "Edit App: ${name}"
@@ -187,26 +199,29 @@ class ApplicationController {
         ['app': app, 'typeList': typeList]
     }
 
-    def update = {
+    def update() {
         String name = params.name
         UserContext userContext = UserContext.of(request)
+        String group = params.group
         String type = params.type
         String desc = params.description
         String owner = params.owner
         String email = params.email
+        String tags = normalizeTagDelimiter(params.tags)
         String monitorBucketTypeString = params.monitorBucketType
         try {
             MonitorBucketType bucketType = Enum.valueOf(MonitorBucketType, monitorBucketTypeString)
-            applicationService.updateRegisteredApplication(userContext, name, type, desc, owner, email,
-                    bucketType)
-            flash.message = "Application '${name}' has been updated."
+            def result = applicationService.updateRegisteredApplication(
+                userContext, name, group, type, desc, owner, email, bucketType, tags
+            )
+            flash.message = result.toString()
         } catch (Exception e) {
             flash.message = "Could not update Application: ${e}"
         }
         redirect(action: 'show', params: [id: name])
     }
 
-    def delete = {
+    def delete() {
         String name = params.name
         UserContext userContext = UserContext.of(request)
         log.info "Delete App: ${name}"
@@ -223,7 +238,7 @@ class ApplicationController {
         redirect(action: 'list')
     }
 
-    def security = {
+    def security() {
         String name = params.name
         String securityGroupId = params.securityGroupId
         UserContext userContext = UserContext.of(request)
@@ -247,7 +262,7 @@ class ApplicationController {
         ]
     }
 
-    def securityUpdate = {
+    def securityUpdate() {
         String name = params.name
         UserContext userContext = UserContext.of(request)
         List<String> selectedGroups = Requests.ensureList(params.selectedGroups)
@@ -259,23 +274,42 @@ class ApplicationController {
 
     // Security Group permission updating logic
 
-    private void updateSecurityEgress(UserContext userContext, SecurityGroup srcGroup, List<String> selectedGroups, Map portMap) {
-        awsEc2Service.getSecurityGroups(userContext).each {SecurityGroup targetGroup ->
-            boolean wantAccess = selectedGroups.any {it == targetGroup.groupName} && portMap[targetGroup.groupName] != ''
-            String  wantPorts = wantAccess ? portMap[targetGroup.groupName] : null
+    private void updateSecurityEgress(UserContext userContext, SecurityGroup srcGroup, List<String> selectedGroups,
+                                      Map portMap) {
+        awsEc2Service.getSecurityGroups(userContext).each { SecurityGroup targetGroup ->
+            boolean wantAccess = selectedGroups.any { it == targetGroup.groupName } &&
+                    portMap[targetGroup.groupName] != ''
+            String wantPorts = wantAccess ? portMap[targetGroup.groupName] : null
             List<IpPermission> wantPerms = awsEc2Service.permissionsFromString(wantPorts)
             awsEc2Service.updateSecurityGroupPermissions(userContext, targetGroup, srcGroup, wantPerms)
         }
     }
 
+    private static String normalizeTagDelimiter(String tags) {
+        // Fail early & means we can support null parameters
+        if (!tags) {
+            return
+        }
+
+        if (tags.contains(",")) {
+            tags.split(',')*.trim().join(',')
+        } else {
+            tags.split()*.trim().join(',')
+        }
+    }
 }
 
 class ApplicationCreateCommand {
+
     String name
     String email
     String type
     String description
     String owner
+    String tags
+    String monitorBucketType
+    boolean requestedFromGui
+
     static constraints = {
         name(nullable: false, blank: false, size: 1..Relationships.APPLICATION_MAX_LENGTH,
                 validator: { value, command ->
@@ -289,6 +323,8 @@ class ApplicationCreateCommand {
         email(nullable: false, blank: false, email: true)
         type(nullable: false, blank: false)
         description(nullable: false, blank: false)
+        monitorBucketType(nullable: false, blank: false)
         owner(nullable: false, blank: false)
+        tags(nullable: true, blank: true)
     }
 }

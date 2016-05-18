@@ -15,10 +15,8 @@
  */
 package com.netflix.asgard
 
-import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.ec2.model.Image
 import com.amazonaws.services.ec2.model.Tag
-import com.netflix.asgard.mock.Mocks
 import org.junit.Before
 import org.junit.Test
 
@@ -26,17 +24,7 @@ class MonkeyPatcherTests {
 
     @Before
     void setUp() {
-        Mocks.monkeyPatcherService().afterPropertiesSet()
-    }
-
-    @Test
-    void testAddClassNameToStringOutputForAmazonServiceException() {
-        AmazonServiceException ase = new AmazonServiceException('Bad things happened')
-        ase.errorCode = 'Throttling'
-        ase.requestId = '45678'
-        ase.statusCode = 400
-        ase.serviceName = 'AutoScaling'
-        assert 'AmazonServiceException: Status Code: 400, AWS Service: AutoScaling, AWS Request ID: 45678, AWS Error Code: Throttling, AWS Error Message: Bad things happened' == ase.toString()
+        new MonkeyPatcherService().createDynamicMethods()
     }
 
     @Test
@@ -79,6 +67,6 @@ class MonkeyPatcherTests {
         image.tags = [new Tag('expiration_time', 'the future')]
         assert !image.keepForever
         image.tags = [new Tag('expiration_time', 'never')]
-        assert image.keepForever == true
+        assert image.keepForever
     }
 }

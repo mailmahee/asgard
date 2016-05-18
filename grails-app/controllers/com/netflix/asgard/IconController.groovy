@@ -20,29 +20,30 @@ import grails.converters.XML
 
 class IconController {
 
-    def index = { redirect(action: 'list', params:params) }
+    def index = { redirect(action: 'list', params: params) }
 
-    private static final String MID_PATH = 'images/tango/'
+    private static final String IMAGES_PATH = "/../grails-app/assets/images/"
 
-    def list = {
+    @SuppressWarnings('GrailsServletContextReference')
+    def list() {
         // Get all the png files within web-app/images/tango/ on a Mac workstation or Linux server
         List iconSets = []
-        String tangoPath = "${servletContext.getRealPath('/')}${MID_PATH}"
+        String tangoPath = servletContext.getRealPath("${IMAGES_PATH}tango/")
         if (params.id) {
             tangoPath += params.id
         }
 
-        new File(tangoPath).eachDirRecurse{File dir ->
+        new File(tangoPath).eachDirRecurse { File dir ->
             if (dir.list().size() > 0) {
                 def icons = []
-                dir.eachFile{ file ->
+                dir.eachFile { file ->
                     if (file.name.endsWith(".png")) {
-                        icons.push(new Expando(name: file.name, path: makeUri(file, tangoPath)))
+                        icons.push(new Expando(name: file.name, path: makeUri(file)))
                     }
                 }
                 icons.sort { it.name }
                 if (icons.size()) {
-                    def iconSet = new Expando(icons: icons, dir: dir.name, path: makeUri(dir, tangoPath))
+                    def iconSet = new Expando(icons: icons, dir: dir.name, path: makeUri(dir))
                     iconSets.push(iconSet)
                 }
                 iconSets.sort { it.path }
@@ -56,10 +57,11 @@ class IconController {
             xml { new XML(icons).render(response) }
             json { new JSON(icons).render(response) }
         }
+
     }
 
-    private String makeUri(File file, String imagesDirPath) {
-        "${MID_PATH}${file.path - imagesDirPath}"
+    private String makeUri(File file) {
+        file.path - servletContext.getRealPath(IMAGES_PATH)
     }
 
 }

@@ -34,6 +34,7 @@
       </div>
     </g:hasErrors>
     <g:form action="save" method="post" class="validate">
+      <g:hiddenField name="requestedFromGui" value="true" />
       <div class="dialog">
         <table>
           <tbody>
@@ -43,6 +44,14 @@
             </td>
             <td valign="top">
               <input type="text" id="name" name="name" value="${params.name}" class="required"/>
+            </td>
+          </tr>
+          <tr class="prop">
+            <td valign="top" class="name">
+              <label for="group">App Group:</label>
+            </td>
+            <td valign="top">
+              <input type="text" id="group" name="group" value="${params.group}"/>
             </td>
           </tr>
           <tr class="prop">
@@ -86,12 +95,20 @@
           </tr>
           <tr class="prop">
             <td class="name">
+              <label for="tags">Tags:</label>
+            </td>
+            <td class="value">
+              <input type="text" id="tags" name="tags" value="${params.tags ?: ''}"/>
+            </td>
+          </tr>
+          <tr class="prop">
+            <td class="name">
               <label for="monitorBucketType">Monitor<br/>Bucket Type:</label>
             </td>
             <td class="value">
               <select id="monitorBucketType" name="monitorBucketType">
                 <g:each var="bucketType" in="${MonitorBucketType.values()}">
-                  <option ${MonitorBucketType.getDefaultForNewApps() == bucketType.name() ? 'selected' : ''} value="${bucketType.name()}">${bucketType.description}</option>
+                  <option ${MonitorBucketType.getDefaultForNewApps() == bucketType ? 'selected' : ''} value="${bucketType.name()}">${bucketType.description}</option>
                 </g:each>
               </select>
             </td>

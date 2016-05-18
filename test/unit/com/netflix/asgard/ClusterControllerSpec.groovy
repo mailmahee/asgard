@@ -1,3 +1,18 @@
+/*
+ * Copyright 2013 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.netflix.asgard
 
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
@@ -15,13 +30,14 @@ import com.netflix.asgard.push.GroupCreateOperation
 import com.netflix.asgard.push.GroupCreateOptions
 import grails.test.mixin.TestFor
 import spock.lang.Specification
+import spock.lang.Unroll
 
 @SuppressWarnings(["GroovyAssignabilityCheck"])
 @TestFor(ClusterController)
 class ClusterControllerSpec extends Specification {
 
     final Closure<SubnetData> subnet = { String id, String zone, String purpose ->
-        new SubnetData(subnetId: id, availabilityZone: zone, purpose: purpose, target: SubnetTarget.EC2, vpcId: 'vpc-1')
+        new SubnetData(subnetId: id, availabilityZone: zone, purpose: purpose, target: SubnetTarget.EC2, vpcId: 'vpc1')
     }
 
     final Subnets subnets = new Subnets([
@@ -59,6 +75,8 @@ class ClusterControllerSpec extends Specification {
             awsLoadBalancerService = Mock(AwsLoadBalancerService)
             awsLoadBalancerService.getLoadBalancers(_) >> []
             configService = Mock(ConfigService)
+            configService.clusterMaxGroups >> 3
+            deploymentService = Mock(DeploymentService)
         }
     }
 
@@ -89,10 +107,12 @@ class ClusterControllerSpec extends Specification {
         controller.awsAutoScalingService.getCluster(_, 'helloworld-example') >> {
             new Cluster([
                     AutoScalingGroupData.from(new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v014',
+                            createdTime: new Date(1398890600000),
                             instances: [new Instance(instanceId: 'i-8ee4eeee')]), [:], [], [:], []),
                     AutoScalingGroupData.from(new AutoScalingGroup(autoScalingGroupName: 'helloworld-example-v015',
-                            instances: [new Instance(instanceId: 'i-6ef9f30e'), new Instance(instanceId: 'i-95fe1df6')]),
-                            [:], [], [:], [])
+                            createdTime: new Date(1398890700000),
+                            instances: [new Instance(instanceId: 'i-6ef9f30e'),
+                                    new Instance(instanceId: 'i-95fe1df6')]), [:], [], [:], [])
             ])
         }
         controller.params.id = 'helloworld-example'
@@ -127,6 +147,7 @@ class ClusterControllerSpec extends Specification {
         controller.params.name = 'helloworld-example'
 
         when:
+        request.method = 'POST'
         controller.createNextGroup()
 
         then:
@@ -169,6 +190,7 @@ class ClusterControllerSpec extends Specification {
         }
 
         when:
+        request.method = 'POST'
         controller.createNextGroup()
 
         then:
@@ -202,6 +224,23 @@ class ClusterControllerSpec extends Specification {
         }
     }
 
+    @Unroll
+    def 'integer conversion should allow any valid integer'(String toConvert, Integer defaultValue, Integer expected) {
+        expect:
+        controller.convertToIntOrUseDefault(toConvert, defaultValue) == expected
+
+        where:
+        toConvert | defaultValue | expected
+        "nonInt"  | 100          | 100
+        "1"       | 100          | 1
+        "0"       | 100          | 0
+        "-1"      | 100          | -1
+        null      | 100          | 100
+        ""        | 100          | 100
+        " "       | 100          | 100
+        " 123 "   | 100          | 123
+    }
+
     def 'next group should have selections over defaults'() {
         controller.awsAutoScalingService.getCluster(_, 'helloworld-example') >> constructClusterFromAsg(asg)
         controller.awsAutoScalingService.getLaunchConfiguration(_, 'helloworld-lc') >> launchConfiguration
@@ -210,7 +249,7 @@ class ClusterControllerSpec extends Specification {
             selectedSecurityGroups = 'sg-789'
             selectedZones = 'us-east-1e'
             terminationPolicy = 'hello-tp2'
-            selectedLoadBalancers = 'hello-elb2'
+            selectedLoadBalancersForVpcIdvpc1 = 'hello-elb2'
             azRebalance = 'disabled'
             min = '13'
             desiredCapacity = '15'
@@ -227,6 +266,7 @@ class ClusterControllerSpec extends Specification {
         }
 
         when:
+        request.method = 'POST'
         controller.createNextGroup()
 
         then:
@@ -259,5 +299,4 @@ class ClusterControllerSpec extends Specification {
             }
         }
     }
-
 }

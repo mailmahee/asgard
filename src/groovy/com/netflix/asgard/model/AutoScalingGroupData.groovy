@@ -78,7 +78,7 @@ class AutoScalingGroupData {
                 awsAutoScalingGroup.healthCheckType,
                 awsAutoScalingGroup.healthCheckGracePeriod,
                 awsAutoScalingGroup.terminationPolicies,
-                awsAutoScalingGroup.suspendedProcessTypes,
+                (Collection) awsAutoScalingGroup.suspendedProcessTypes,
                 awsAutoScalingGroup.desiredCapacity,
                 awsAutoScalingGroup.status,
                 awsAutoScalingGroup.availabilityZones,
@@ -99,10 +99,10 @@ class AutoScalingGroupData {
         vpcZoneIdentifier ?: null
     }
 
-    static AutoScalingGroupData forUpdate(String name, String launchConfigurationName,
-                                              minSize, desiredCapacity, maxSize, defaultCooldown,
-                                              String healthCheckType, Integer healthCheckGracePeriod,
-                                              List<String> terminationPolicies, Collection<String> availabilityZones) {
+    static AutoScalingGroupData forUpdate(String name, String launchConfigurationName, Integer minSize,
+                                          Integer desiredCapacity, Integer maxSize, Integer defaultCooldown,
+                                          String healthCheckType, Integer healthCheckGracePeriod,
+                                          List<String> terminationPolicies, Collection<String> availabilityZones) {
 
         new AutoScalingGroupData(
                 name,
@@ -155,10 +155,10 @@ class AutoScalingGroupData {
 
         List<GroupedInstance> groupedInstances = instances.collect { Instance inst ->
             String instanceId = inst.instanceId
-            Collection<LoadBalancerDescription> loadBalancersForInstance = instanceIdsToLoadBalancerLists?.get(instanceId)
+            Collection<LoadBalancerDescription> lbsForInstance = instanceIdsToLoadBalancerLists?.get(instanceId)
             MergedInstance mergedInstance = mergedInstances?.find { it.instanceId == instanceId }
             Image image = imageIdsToImages?.get(mergedInstance?.amiId)
-            GroupedInstance.from(inst, loadBalancersForInstance, mergedInstance, image)
+            GroupedInstance.from(inst, lbsForInstance, mergedInstance, image)
         }.sort { GroupedInstance inst -> inst.launchTime }
         this.instances = Collections.unmodifiableList(groupedInstances)
 
@@ -173,6 +173,7 @@ class AutoScalingGroupData {
         autoScalingProcessType in suspendedProcessTypes
     }
 
+    @SuppressWarnings(["GroovyUnusedDeclaration", "Used by front end code"])
     Boolean isDeleteInProgress() {
         status == 'Delete in progress'
     }
@@ -181,10 +182,11 @@ class AutoScalingGroupData {
         Relationships.parts(autoScalingGroupName)
     }
 
+    @SuppressWarnings(["GroovyUnusedDeclaration", "Used by front end code"])
     AppVersion getMostCommonAppVersion() {
 
         // Identify the most popular AppVersion
-        Bag<AppVersion> countsOfAppVersions = new HashBag<AppVersion>()
+        Bag countsOfAppVersions = new HashBag()
         instances*.appVersion.findAll { it != null }.each { countsOfAppVersions.add(it) }
         Set<AppVersion> appVersions = countsOfAppVersions.uniqueSet()
         AppVersion mostCommon = appVersions.size() > 0 ? appVersions.iterator().next() : null
@@ -241,10 +243,12 @@ class AutoScalingGroupData {
         AutoScalingProcessType.with { [Launch, Terminate] }.intersect(suspendedProcessTypes)
     }
 
+    @SuppressWarnings(["GroovyUnusedDeclaration", "Used by front end code"])
     Boolean seemsDisabled() {
         return (getSuspendedPrimaryProcessTypes() || expirationTime)
     }
 
+    @SuppressWarnings(["GroovyUnusedDeclaration", "Used by front end code"])
     boolean isZoneRebalancingSuspended() {
         isProcessSuspended(AutoScalingProcessType.AZRebalance)
     }

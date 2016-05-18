@@ -83,7 +83,8 @@ class ImageServiceMassDeleteSpec extends ImageServiceSpec {
 
         then:
         IllegalStateException e = thrown(IllegalStateException)
-        e.message == 'Aborting mass delete. In test us-east-1 only 1 AMIs were tagged with last_referenced_time recently, although 2 AMIs are in use. Is tagging broken?'
+        e.message == 'Aborting mass delete. In test us-east-1 only 1 AMIs were tagged with last_referenced_time ' +
+                'recently, although 2 AMIs are in use. Is tagging broken?'
     }
 
     def 'should delete if owned by this account and not used recently'() {
@@ -182,7 +183,7 @@ class ImageServiceMassDeleteSpec extends ImageServiceSpec {
         Exception e = new Exception('foo')
 
         when:
-        awsEc2Service.getImage(userContext, IMAGE_ID) >> { throw e}
+        awsEc2Service.getImage(userContext, IMAGE_ID) >> { throw e }
         prototypeRequest.mode = JanitorMode.EXECUTE
         List<Image> toDelete = imageService.massDelete(userContext, prototypeRequest)
 
@@ -200,7 +201,8 @@ class ImageServiceMassDeleteSpec extends ImageServiceSpec {
         awsEc2Service.getInstances(userContext) >> []
         awsAutoScalingService.getLaunchConfigurations(userContext) >> []
         configService.excludedLaunchPermissionsForMassDelete >> [Mocks.PROD_AWS_ACCOUNT_ID]
-        awsEc2Service.getImagesWithLaunchPermissions(userContext, [Mocks.PROD_AWS_ACCOUNT_ID], [IMAGE_ID, 'imageId2']) >> [image2]
+        awsEc2Service.getImagesWithLaunchPermissions(userContext,
+                [Mocks.PROD_AWS_ACCOUNT_ID], [IMAGE_ID, 'imageId2']) >> [image2]
 
         when:
         List<Image> toDelete = imageService.massDelete(userContext, prototypeRequest)
@@ -221,10 +223,12 @@ class ImageServiceMassDeleteSpec extends ImageServiceSpec {
 
         then:
         IllegalStateException e = thrown(IllegalStateException)
-        e.message == 'Aborting mass delete. In test us-east-1 the following in use images were marked for delete: [imageId]'
+        e.message == 'Aborting mass delete. In test us-east-1 the following in use images were marked for ' +
+                'delete: [imageId]'
     }
 
-    Image setupSingleImage(DateTime creationTime, DateTime lastReferencedTime, String ownerId = Mocks.TEST_AWS_ACCOUNT_ID) {
+    Image setupSingleImage(DateTime creationTime, DateTime lastReferencedTime,
+                           String ownerId = Mocks.TEST_AWS_ACCOUNT_ID) {
         setupLastReferencedDefaults()
         Image image = createImage(creationTime, lastReferencedTime, ownerId)
         awsEc2Service.getAccountImages(userContext) >> [image]
@@ -236,8 +240,8 @@ class ImageServiceMassDeleteSpec extends ImageServiceSpec {
     Image createImage(DateTime creationTime, DateTime lastReferencedTime, String ownerId = Mocks.TEST_AWS_ACCOUNT_ID) {
         Image image = new Image()
         image.metaClass {
-            getCreationTime { creationTime ? Time.format(creationTime) : ''}
-            getLastReferencedTime { lastReferencedTime ? Time.format(lastReferencedTime) : ''}
+            getCreationTime { creationTime ? Time.format(creationTime) : '' }
+            getLastReferencedTime { lastReferencedTime ? Time.format(lastReferencedTime) : '' }
             isKeepForever { false }
         }
         image.imageId = IMAGE_ID

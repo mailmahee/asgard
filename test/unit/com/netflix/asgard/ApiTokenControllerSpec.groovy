@@ -16,9 +16,9 @@
 package com.netflix.asgard
 
 import com.netflix.asgard.auth.ApiToken
-import com.netflix.asgard.mock.ShiroTestUtil
 import grails.test.MockUtils
 import grails.test.mixin.TestFor
+import org.apache.shiro.SecurityUtils
 import org.apache.shiro.subject.Subject
 import spock.lang.Specification
 import spock.lang.Unroll
@@ -27,21 +27,15 @@ import spock.lang.Unroll
 class ApiTokenControllerSpec extends Specification {
 
     def configService = Mock(ConfigService)
-    def secretService = Mock(SecretService)
 
     Subject subject = Mock(Subject)
 
     def setup() {
         controller.configService = configService
-        controller.secretService = secretService
         MockUtils.prepareForConstraintsTests(GenerateApiTokenCommand)
 
         subject.principal >> 'testUser@netflix.com'
-        ShiroTestUtil.setSubject(subject)
-    }
-
-    def cleanup() {
-        ShiroTestUtil.tearDownShiro()
+        SecurityUtils.metaClass.static.getSubject = { subject }
     }
 
     def 'should return 401 if api tokens disabled'() {
@@ -68,7 +62,7 @@ class ApiTokenControllerSpec extends Specification {
     }
 
     def 'should return api token for valid request'() {
-        secretService.currentApiEncryptionKey >> 'key'
+        configService.currentApiEncryptionKey >> 'key'
         configService.apiTokenExpirationDays >> 90
         subject.principal >> 'test@netflix.com'
         GenerateApiTokenCommand command = new GenerateApiTokenCommand(purpose: 'ThisPurpose',
@@ -76,6 +70,7 @@ class ApiTokenControllerSpec extends Specification {
         command.validate()
 
         when:
+        request.method = 'POST'
         controller.generate(command)
 
         then:
@@ -89,6 +84,7 @@ class ApiTokenControllerSpec extends Specification {
         command.validate()
 
         when:
+        request.method = 'POST'
         controller.generate(command)
 
         then:
@@ -106,13 +102,13 @@ class ApiTokenControllerSpec extends Specification {
 
         where:
 
-        purpose | valid
-        null    | false
-        ''      | false
-        'ab12'  | true
-        'ab_12.'| true
-        'ab 12' | false
-        'ab:12' | false
+        purpose  | valid
+        null     | false
+        ''       | false
+        'ab12'   | true
+        'ab_12.' | true
+        'ab 12'  | false
+        'ab:12'  | false
     }
 
     @Unroll("hasErrors should return #valid when email is #email")

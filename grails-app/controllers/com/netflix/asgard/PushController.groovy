@@ -27,7 +27,9 @@ import java.rmi.NoSuchObjectException
 @ContextParam('region')
 class PushController {
 
-    def static allowedMethods = [startRolling:'POST']
+    static allowedMethods = [startRolling: 'POST']
+
+    static editActions = ['editRolling']
 
     def awsAutoScalingService
     def awsEc2Service
@@ -36,17 +38,22 @@ class PushController {
     def spotInstanceRequestService
     def grailsApplication
 
-    def index = { redirect(controller:"autoScaling", action:"list", params:params) }
+    def index() {
+        redirect(controller: "autoScaling", action: "list", params: params)
+    }
 
-    def editRolling = {
+    def editRolling() {
         UserContext userContext = UserContext.of(request)
         String name = params.id ?: params.name
         boolean showAllImages = params.allImages ? true : false
 
         Map attrs = [:]
         try {
-            attrs = pushService.prepareEdit(userContext, name, showAllImages, actionName,
+            attrs = pushService.prepareEdit(userContext, name, showAllImages,
                     Requests.ensureList(params.selectedSecurityGroups))
+            attrs.putAll([
+                    pricing: params.pricing ?: attrs.pricing
+            ])
         } catch (NoSuchObjectException ignored) {
             Requests.renderNotFound('Auto Scaling Group', name, this)
             return
@@ -59,7 +66,7 @@ class PushController {
         attrs
     }
 
-    def startRolling = {
+    def startRolling() {
         UserContext userContext = UserContext.of(request)
         List<String> selectedSecurityGroups = Requests.ensureList(params.selectedSecurityGroups)
 
@@ -108,18 +115,20 @@ class PushController {
             redirect(controller: 'task', action: 'show', params: [id: pushOperation.taskId])
         } catch (Exception e) {
             flash.message = "Could not start push: ${e}"
-            redirect(controller:"autoScaling", action:"show", params:[name:params.name])
+            redirect(controller: "autoScaling", action: "show", params: [name: params.name])
         }
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 
-    def enableTimeouts = {
+    def enableTimeouts() {
         RollingPushOperation.timeoutsEnabled = true
         render "Push timeouts disabled"
     }
 
-    def disableTimeouts = {
+    def disableTimeouts() {
         RollingPushOperation.timeoutsEnabled = false
         render "Push timeouts enabled"
     }

@@ -17,7 +17,7 @@ package com.netflix.asgard.mock
 
 import com.amazonaws.AmazonServiceException
 import com.amazonaws.ClientConfiguration
-import com.amazonaws.auth.BasicAWSCredentials
+import com.amazonaws.auth.AWSCredentialsProvider
 import com.amazonaws.services.simpledb.AmazonSimpleDBClient
 import com.amazonaws.services.simpledb.model.Attribute
 import com.amazonaws.services.simpledb.model.BatchDeleteAttributesRequest
@@ -54,9 +54,9 @@ class MockAmazonSimpleDBClient extends AmazonSimpleDBClient {
                     new Attribute('type', it.type), new Attribute('owner', it.owner),
                     new Attribute('email', it.email),
                     new Attribute('createTs',
-                            '' + ISODateTimeFormat.dateTimeParser().parseDateTime(it.createTime).millis),
+                            ISODateTimeFormat.dateTimeParser().parseDateTime(it.createTime).millis.toString()),
                     new Attribute('updateTs',
-                            '' + ISODateTimeFormat.dateTimeParser().parseDateTime(it.updateTime).millis)
+                            ISODateTimeFormat.dateTimeParser().parseDateTime(it.updateTime).millis.toString())
             )
         }
     }
@@ -89,8 +89,8 @@ class MockAmazonSimpleDBClient extends AmazonSimpleDBClient {
         )]
     }
 
-    MockAmazonSimpleDBClient(BasicAWSCredentials awsCredentials, ClientConfiguration clientConfiguration) {
-        super(awsCredentials as BasicAWSCredentials, clientConfiguration)
+    MockAmazonSimpleDBClient(AWSCredentialsProvider credentialsProvider, ClientConfiguration clientConfiguration) {
+        super(credentialsProvider, clientConfiguration)
         mockAppItems = loadMockAppItems()
         mockDomains = loadMockDomains()
     }

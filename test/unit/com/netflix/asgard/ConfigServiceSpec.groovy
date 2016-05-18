@@ -15,12 +15,31 @@
  */
 package com.netflix.asgard
 
-import spock.lang.Specification
 import com.netflix.asgard.mock.Mocks
+import spock.lang.Specification
 
 class ConfigServiceSpec extends Specification {
 
     ConfigService configService = new ConfigService(grailsApplication: Mocks.grailsApplication())
+
+    def 'should return true for m3 instance custom checks'(){
+        expect:
+        configService.instanceTypeNeedsEbsVolumes('m3.') == false
+        configService.instanceTypeNeedsCustomVolumes('m3.') == true
+        configService.getDeviceNameVirtualNameMapping() == ['/dev/sdb': 'ephemeral0', '/dev/sdc': 'ephemeral1']
+        configService.getSizeOfEbsVolumesAddedToLaunchConfigs() == 125
+        configService.getEbsVolumeDeviceNamesForLaunchConfigs() == ['/dev/sdb', '/dev/sdc']
+    }
+
+    def 'should return false instance monitoring'() {
+        expect:
+        configService.enableInstanceMonitoring == false
+    }
+
+    def 'should return reserved instance filter if provided'(){
+        expect:
+        configService.getReservationOfferingTypeFilters() == []
+    }
 
     def 'should return correct excluded launch permissions for mass delete'() {
         expect:
@@ -35,7 +54,7 @@ class ConfigServiceSpec extends Specification {
     def 'cachedUserDataMaxLength should be at least zero'() {
         when:
         ConfigService configService = new ConfigService(grailsApplication: [
-            config: [ cloud: [ cachedUserDataMaxLength: -5 ] ]
+                config: [cloud: [cachedUserDataMaxLength: -5]]
         ])
         then:
         configService.getCachedUserDataMaxLength() == 0
@@ -44,7 +63,7 @@ class ConfigServiceSpec extends Specification {
     def 'cachedUserDataMaxLength can be overridden'() {
         when:
         ConfigService configService = new ConfigService(grailsApplication: [
-            config: [ cloud: [ cachedUserDataMaxLength: 20 ] ]
+                config: [cloud: [cachedUserDataMaxLength: 20]]
         ])
         then:
         configService.getCachedUserDataMaxLength() == 20

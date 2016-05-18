@@ -49,13 +49,14 @@
             <h2>Alarm</h2>
           </td>
         </tr>
+        <g:render template="/alarm/metricSelection"/>
         <g:render template="/alarm/alarmOptions"/>
         </tbody>
       </table>
     </div>
     <div class="buttons">
       <input type="hidden" name="group" value="${group}"/>
-      <g:buttonSubmit class="save" value="save">Create New Scaling Policy</g:buttonSubmit>
+      <g:buttonSubmit class="save keep" value="save">Create New Scaling Policy</g:buttonSubmit>
     </div>
   </g:form>
 </div>

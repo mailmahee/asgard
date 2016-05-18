@@ -17,6 +17,8 @@ package com.netflix.asgard
 
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.LaunchConfiguration
+import com.amazonaws.services.ec2.model.GroupIdentifier
+import com.netflix.asgard.model.JanitorMode
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
@@ -33,11 +35,13 @@ class LaunchConfigurationController {
     def flagService
     def instanceTypeService
 
-    def static allowedMethods = [delete:'POST', save:'POST', update:'POST', cleanup: 'POST', massDelete: 'POST']
+    static allowedMethods = [delete: 'POST', save: 'POST', update: 'POST', cleanup: 'POST', massDelete: 'POST']
 
-    def index = { redirect(action: 'list', params:params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
         Collection<LaunchConfiguration> launchConfigs = awsAutoScalingService.getLaunchConfigurations(userContext)
@@ -59,7 +63,7 @@ class LaunchConfigurationController {
         }
     }
 
-    def terse = {
+    def terse() {
         UserContext userContext = UserContext.of(request)
         List<String> columns = Requests.ensureList(params.columns).collect { it.split(',') }.flatten().sort()
         columns = columns ?: ['launchConfigurationName', 'imageId']
@@ -79,7 +83,7 @@ class LaunchConfigurationController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String name = params.name ?: params.id
         LaunchConfiguration lc = awsAutoScalingService.getLaunchConfiguration(userContext, name)
@@ -89,12 +93,15 @@ class LaunchConfigurationController {
             String appName = Relationships.appNameFromLaunchConfigName(name)
             AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroupForLaunchConfig(userContext, name)
             String clusterName = Relationships.clusterFromGroupName(group?.autoScalingGroupName)
-            def details = [
-                    'lc': lc,
-                    'image': awsEc2Service.getImage(userContext, lc.imageId),
-                    'app': applicationService.getRegisteredApplication(userContext, appName),
-                    'group': group,
-                    'cluster': clusterName
+            List<GroupIdentifier> securityGroups = awsEc2Service.getSecurityGroupNameIdPairsByNamesOrIds(userContext,
+                    lc.securityGroups)
+            Map details = [
+                    lc: lc,
+                    image: awsEc2Service.getImage(userContext, lc.imageId),
+                    app: applicationService.getRegisteredApplication(userContext, appName),
+                    group: group,
+                    cluster: clusterName,
+                    securityGroups: securityGroups
             ]
             withFormat {
                 html { return details }
@@ -104,7 +111,7 @@ class LaunchConfigurationController {
         }
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
         def name = params.name
         def matchingGroup = awsAutoScalingService.getAutoScalingGroups(userContext).find {
@@ -124,17 +131,7 @@ class LaunchConfigurationController {
         redirect(action: 'list')
     }
 
-    def massDelete = {
-        UserContext userContext = UserContext.of(request)
-        Integer daysAgo = params.daysAgo as Integer
-        String message = doMassDelete(userContext, daysAgo)
-        render "<pre>${message}</pre>"
-    }
-
-    // This is the old clean up endpoint. After a release, the Jenkins job can be changed to point to massDelete. Then
-    // this method can be deleted.
-    @Deprecated
-    def cleanup = {
+    def massDelete() {
         UserContext userContext = UserContext.of(request)
         Integer daysAgo = params.daysAgo as Integer
         String message = doMassDelete(userContext, daysAgo)
@@ -142,28 +139,41 @@ class LaunchConfigurationController {
     }
 
     private String doMassDelete(UserContext userContext, int daysAgo) {
-        Check.atLeast(10, daysAgo, 'daysAgo')
+        Check.atLeast(1, daysAgo, 'daysAgo')
         DateTime cutOffDate = new DateTime().minusDays(daysAgo)
+        boolean deleteUnreferenced = params.deleteUnreferenced ? Boolean.valueOf(params.deleteUnreferenced) : false
+        JanitorMode mode = params.mode ? JanitorMode.valueOf(params.mode) : JanitorMode.EXECUTE
         Collection<AutoScalingGroup> allGroups = awsAutoScalingService.getAutoScalingGroups(userContext)
         Collection<LaunchConfiguration> allConfigs = awsAutoScalingService.getLaunchConfigurations(userContext)
         Collection<LaunchConfiguration> oldUnusedConfigs = allConfigs.findAll { LaunchConfiguration lc ->
             Boolean configIsOld = new DateTime(lc.createdTime.time).isBefore(cutOffDate)
             Boolean configNotInUse = !(allGroups.any { it.launchConfigurationName == lc.launchConfigurationName })
-            configIsOld && configNotInUse
+            (configIsOld && configNotInUse) || (deleteUnreferenced && !autoscalingGroupExists(userContext, lc))
         }
+
         DateTimeFormatter formatter = ISODateTimeFormat.date()
-        String message = "Deleting ${oldUnusedConfigs.size()} unused launch configs from before" +
+
+        String executeMessage = "Deleting ${oldUnusedConfigs.size()} unused launch configs from before" +
                 " ${formatter.print(cutOffDate)} \n"
+        String dryRunMessage = "Dry run mode. If executed, this job would delete ${oldUnusedConfigs.size()} unused" +
+                "launch configs from before ${formatter.print(cutOffDate)} \n"
+        String message = JanitorMode.EXECUTE == mode ? executeMessage : dryRunMessage
         oldUnusedConfigs.sort { it.createdTime }
         oldUnusedConfigs.each { LaunchConfiguration lc ->
             try {
-                awsAutoScalingService.deleteLaunchConfiguration(userContext, lc.launchConfigurationName)
+                if (mode == JanitorMode.EXECUTE) {
+                    awsAutoScalingService.deleteLaunchConfiguration(userContext, lc.launchConfigurationName)
+                }
                 message += "Deleted ${formatter.print(lc.createdTime.time)} ${lc.launchConfigurationName} \n"
             } catch (Exception e) {
                 message += "Could not delete Launch Configuration ${lc.launchConfigurationName}: ${e} \n"
             }
         }
         return message
+    }
+
+    private boolean autoscalingGroupExists(UserContext userContext, LaunchConfiguration lc) {
+        awsAutoScalingService.getAutoScalingGroupForLaunchConfig(userContext, lc.launchConfigurationName)
     }
 
 }

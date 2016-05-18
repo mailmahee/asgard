@@ -71,12 +71,8 @@
                     ${perm.ipProtocol} ${perm.fromPort}-${perm.toPort}
                     [<g:each var="pair" in="${perm.userIdGroupPairs}" status="j">
                       <g:if test="${j>0}">, </g:if>
-                      <g:if test="${pair.userId == group.ownerId}">
-                        <g:linkObject type="security" name="${pair.groupId}">${pair.groupName}</g:linkObject>
-                      </g:if>
-                      <g:else>
-                        <div class="security">${pair.groupName} (${accountNames[pair.userId] ?: pair.userId} ${pair.groupId})</div>
-                      </g:else>
+                      <g:if test="${pair.userId == group.ownerId}"><g:securityGroup group="${pair}"/></g:if>
+                      <g:else><div class="security">${pair.groupName} (${accountNames[pair.userId] ?: pair.userId} ${pair.groupId})</div></g:else>
                     </g:each>]
                     ${perm.ipRanges}
                   </td>
@@ -93,6 +89,30 @@
         <tr class="prop">
           <td class="name">Application:</td>
           <td class="value"><g:linkObject type="application" name="${app?.name}"/></td>
+        </tr>
+        <tr class="prop">
+          <td class="name">Launch Configurations:</td>
+          <td class="value">
+            <g:each var="launchConfig" in="${launchConfigs}" status="i">
+              <g:linkObject type="launchConfiguration" name="${launchConfig.launchConfigurationName}"/>
+            </g:each>
+          </td>
+        </tr>
+        <tr class="prop">
+          <td class="name">Instances:</td>
+          <td class="value">
+            <g:each var="instance" in="${instances}" status="i">
+              <g:linkObject type="instance" name="${instance.instanceId}"/>
+            </g:each>
+          </td>
+        </tr>
+        <tr class="prop">
+          <td class="name">Load Balancers:</td>
+          <td class="value">
+            <g:each var="elb" in="${elbs}" status="i">
+              <g:linkObject type="loadBalancer" name="${elb.loadBalancerName}"/>
+            </g:each>
+          </td>
         </tr>
         </tbody>
       </table>

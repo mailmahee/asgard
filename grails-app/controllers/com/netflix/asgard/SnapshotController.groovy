@@ -26,9 +26,11 @@ class SnapshotController {
 
     def awsEc2Service
 
-    def index = { redirect(action: 'list', params: params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         List<Snapshot> snapshots = awsEc2Service.getSnapshots(userContext).sort { it.snapshotId.toLowerCase() }
         Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
@@ -44,7 +46,7 @@ class SnapshotController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String snapshotId = EntityType.snapshot.ensurePrefix(params.snapshotId ?: params.id)
         def snapshot = awsEc2Service.getSnapshot(userContext, snapshotId)
@@ -66,13 +68,13 @@ class SnapshotController {
         }
     }
 
-    def create = {
+    def create() {
         UserContext userContext = UserContext.of(request)
         def snapshot = awsEc2Service.createSnapshot(userContext, params.volumeId, params.description)
-        redirect(action: 'show', params:[id:snapshot?.snapshotId])
+        redirect(action: 'show', params: [id: snapshot?.snapshotId])
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
 
         List<String> snapshotIds = Requests.ensureList(params.snapshotId ?: params.selectedSnapshots)
@@ -93,7 +95,8 @@ class SnapshotController {
                 message += "Snapshot${deletedSnapshotIds.size() == 1 ? '' : 's'} deleted: ${deletedSnapshotIds}. "
             }
             if (nonexistentSnapshotIds) {
-                message += "Snapshot${nonexistentSnapshotIds.size() == 1 ? '' : 's'} not found: ${nonexistentSnapshotIds}. "
+                int count = nonexistentSnapshotIds.size()
+                message += "Snapshot${count == 1 ? '' : 's'} not found: ${nonexistentSnapshotIds}. "
             }
         } catch (Exception e) {
             message = "Error deleting snapshot${snapshotIds.size() == 1 ? '' : 's'} ${snapshotIds}: ${e}"
@@ -102,12 +105,14 @@ class SnapshotController {
         redirect(action: 'result')
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 
-    def restore = { SnapshotCommand cmd ->
+    def restore(SnapshotCommand cmd) {
         UserContext userContext = UserContext.of(request)
         if (cmd.hasErrors()) {
-            chain(action:'show', model:[snapshotCommand:cmd])
+            chain(action: 'show', model: [snapshotCommand: cmd])
         } else {
             String snapshotId = EntityType.snapshot.ensurePrefix(params.snapshotId ?: params.id)
             try {
@@ -117,7 +122,7 @@ class SnapshotController {
                     params.zone,
                     snapshotId
                 )
-                redirect(controller:"volume", action:'show', params:[id:volume.volumeId])
+                redirect(controller: "volume", action: 'show', params: [id: volume.volumeId])
             } catch (Exception e) {
                 flash.message = "Could not restore from EBS Snapshot: ${e}"
                 redirect(action: 'show', params:[id:snapshotId])

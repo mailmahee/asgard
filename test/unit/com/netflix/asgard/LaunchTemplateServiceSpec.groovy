@@ -15,93 +15,127 @@
  */
 package com.netflix.asgard
 
-import spock.lang.Specification
+import com.amazonaws.services.ec2.model.Image
 import com.amazonaws.services.ec2.model.SecurityGroup
+import com.netflix.asgard.model.AutoScalingGroupBeanOptions
+import com.netflix.asgard.model.LaunchConfigurationBeanOptions
+import com.netflix.asgard.model.LaunchContext
+import com.netflix.asgard.model.MonitorBucketType
+import com.netflix.asgard.plugin.AdvancedUserDataProvider
+import com.netflix.asgard.plugin.UserDataProvider
+import com.netflix.asgard.userdata.DefaultAdvancedUserDataProvider
+import spock.lang.Specification
 
+@SuppressWarnings("GroovyAssignabilityCheck")
 class LaunchTemplateServiceSpec extends Specification {
 
-    ConfigService mockConfigService = Mock(ConfigService)
-    CachedMap mockSecurityGroupCache = Mock(CachedMap)
+    ApplicationService applicationService
+    AwsEc2Service awsEc2Service
+    ConfigService mockConfigService = Stub() {
+        getDefaultSecurityGroups() >> ['dsg1', 'dsg2']
+        getDefaultVpcSecurityGroupNames() >> ['dsg1-vpc']
+    }
+    CachedMap mockSecurityGroupCache = Stub {
+        list() >> [
+            'sg1': [],
+            'dsg1': [],
+            'dsg2': [],
+            'dsg1-vpc': []
+        ].collect { name, details ->
+            new SecurityGroup(groupName: name, groupId: "sg-${name}")
+        }
+    }
     Caches caches
     LaunchTemplateService launchTemplateService
+    PluginService pluginService
+    AdvancedUserDataProvider advancedUserDataProvider
+    UserDataProvider userDataProvider
 
     def setup() {
+        applicationService = Mock(ApplicationService)
+        awsEc2Service = Mock(AwsEc2Service)
         caches = new Caches(new MockCachedMapBuilder([(EntityType.security): mockSecurityGroupCache]))
-        launchTemplateService = new LaunchTemplateService(configService: mockConfigService, caches: caches)
+        advancedUserDataProvider = Mock(DefaultAdvancedUserDataProvider)
+        userDataProvider = Mock(UserDataProvider)
+        pluginService = Mock(PluginService) {
+            getAdvancedUserDataProvider() >> advancedUserDataProvider
+        }
+        advancedUserDataProvider.getPluginService() >> pluginService
+        launchTemplateService = new LaunchTemplateService(configService: mockConfigService, caches: caches,
+                pluginService: pluginService, applicationService: applicationService, awsEc2Service: awsEc2Service)
+        new MonkeyPatcherService().createDynamicMethods()
     }
 
-    def 'should include default security group names'() {
+    def 'should include default security group IDs'() {
         when:
-        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups([])
+        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups([], "", Region.US_EAST_1)
 
         then:
-        securityGroups == ['dsg1', 'dsg2'] as Set
-        1 * mockConfigService.defaultSecurityGroups >> ['dsg1', 'dsg2']
+        securityGroups == ['sg-dsg1', 'sg-dsg2'] as Set
     }
 
-    def 'should not include duplicate security group names'() {
+    def 'should not include duplicate security group IDs'() {
         when:
-        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups(['sg1', 'dsg2'])
+        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups(['sg1', 'dsg2'], "",
+            Region.US_EAST_1)
 
         then:
-        securityGroups == ['sg1', 'dsg1', 'dsg2'] as Set
-        1 * mockConfigService.defaultSecurityGroups >> ['dsg1', 'dsg2']
+        securityGroups == ['sg-sg1', 'sg-dsg1', 'sg-dsg2'] as Set
     }
 
-    def 'should include default VPC security group IDs'() {
-        when:
-        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups([], 'vpc-1', Region.US_EAST_1)
-
-        then:
-        securityGroups == ['sg-101', 'sg-102'] as Set
-        1 * mockConfigService.defaultVpcSecurityGroupNames >> ['dsg1', 'dsg2']
-        1 * mockSecurityGroupCache.get('dsg1') >> new SecurityGroup(groupId: 'sg-101')
-        1 * mockSecurityGroupCache.get('dsg2') >> new SecurityGroup(groupId: 'sg-102')
-    }
-
-    def 'should not include duplicate VPC security group IDs'() {
+    def 'should not include security groups already without cached ID'() {
         when:
         Set<String> securityGroups = launchTemplateService.
-                includeDefaultSecurityGroups(['sg1', 'sg-102'], 'vpc-1', Region.US_EAST_1)
+            includeDefaultSecurityGroups(['sg1', 'sg2'], "", Region.US_EAST_1)
 
         then:
-        securityGroups == ['sg1', 'sg-101', 'sg-102'] as Set
-        1 * mockConfigService.defaultVpcSecurityGroupNames >> ['dsg1', 'dsg2']
-        1 * mockSecurityGroupCache.get('dsg1') >> new SecurityGroup(groupId: 'sg-101')
-        1 * mockSecurityGroupCache.get('dsg2') >> new SecurityGroup(groupId: 'sg-102')
+        securityGroups == ['sg-dsg1', 'sg-dsg2', 'sg-sg1'] as Set
     }
 
-    def 'should not include default VPC security group IDs not in cache'() {
+    def 'should include security groups already referenced by IDs without lookup'() {
         when:
-        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups(['sg1'], 'vpc-1',
-                Region.US_EAST_1)
+        Set<String> securityGroups = launchTemplateService.
+            includeDefaultSecurityGroups(['sg1', 'sg-101'], "", Region.US_EAST_1)
 
         then:
-        securityGroups == ['sg1', 'sg-101'] as Set
-        1 * mockConfigService.defaultVpcSecurityGroupNames >> ['dsg1', 'dsg2']
-        1 * mockSecurityGroupCache.get('dsg1') >> new SecurityGroup(groupId: 'sg-101')
-        1 * mockSecurityGroupCache.get('dsg2') >> null
+        securityGroups == ['sg-dsg1', 'sg-dsg2', 'sg-sg1', 'sg-101'] as Set
     }
 
-    def 'should consistently use id rather than name when ids are specified'() {
-        mockConfigService.defaultSecurityGroups >> ['dsg1']
-        mockSecurityGroupCache.get('dsg1') >> new SecurityGroup(groupId: 'sg-101')
+    def 'should build user data string for auto scaling group and launch config'() {
+
+        UserContext userContext = UserContext.auto(Region.US_WEST_1)
+        AppRegistration application = new AppRegistration(name: 'hello', monitorBucketType: MonitorBucketType.cluster)
+        Image image = new Image(imageId: 'ami-deadfeed')
+        AutoScalingGroupBeanOptions asg = new AutoScalingGroupBeanOptions(autoScalingGroupName: 'hello-wassup',
+                launchConfigurationName: 'hello-wassup-987654321')
+        LaunchConfigurationBeanOptions launchConfig = new LaunchConfigurationBeanOptions(
+                launchConfigurationName: 'hello-wassup-987654321', imageId: image.imageId)
+        launchTemplateService.applicationService = Mock(ApplicationService) {
+            getRegisteredApplication(*_) >> application
+        }
+        launchTemplateService.awsEc2Service = Mock(AwsEc2Service) {
+            getImage(*_) >> image
+        }
 
         when:
-        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups(['sg-100'])
+        String userData = launchTemplateService.buildUserData(userContext, asg, launchConfig)
 
         then:
-        securityGroups == ['sg-100', 'sg-101'] as Set
+        1 * advancedUserDataProvider.buildUserData(
+                new LaunchContext(userContext, image, application, asg, launchConfig)) >> 'ta da!'
+        userData == 'ta da!'
     }
 
-    def 'should consistently use name rather than id when names are specified'() {
-        mockConfigService.defaultSecurityGroups >> ['dsg1']
-        mockSecurityGroupCache.get('dsg1') >> new SecurityGroup(groupId: 'sg-101')
+    def 'should build user data string for image launch alone without an ASG or launch config'() {
+
+        UserContext userContext = UserContext.auto(Region.US_WEST_1)
+        Image image = new Image(imageId: 'ami-deadfeed')
 
         when:
-        Set<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups(['sg1'])
+        String userData = launchTemplateService.buildUserDataForImage(userContext, image)
 
         then:
-        securityGroups == ['sg1', 'dsg1'] as Set
+        1 * advancedUserDataProvider.buildUserData(new LaunchContext(userContext, image, null, null, null)) >> 'ta da!'
+        userData == 'ta da!'
     }
 }

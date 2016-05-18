@@ -24,17 +24,22 @@ enum InstancePriceType {
     /**
      * Pricing for instances that have not been reserved and are needed right away.
      */
-    ON_DEMAND('http://aws.amazon.com/ec2/pricing/', 'pricing-on-demand-instances.json'),
+    ON_DEMAND('http://aws.amazon.com/ec2/pricing/json/', 'linux-od.json'),
 
     /**
-     * Pricing for instances that have been reserved in bulk beforehand and are needed right away.
+     * Instances priced based on the spot market for instances that are not needed right away.
      */
-    RESERVED('http://aws.amazon.com/ec2/pricing/', 'pricing-reserved-instances.json'),
+    SPOT('https://spot-price.s3.amazonaws.com/', 'spot.js')
 
     /**
-     * Pricing for instances based on the spot market for instances that are not needed right away.
+     * Creates enum from a String. Ignores case and defaults to ON_DEMAND if there is not a match.
+     *
+     * @param value String representation
+     * @return new enum based on value
      */
-    SPOT('http://spot-price.s3.amazonaws.com/', 'spot.js')
+    static InstancePriceType parse(String value) {
+        values().find { it.name().equalsIgnoreCase(value) } ?: ON_DEMAND
+    }
 
     /**
      * The beginning of the URL for getting the data file for pricing, when fetching live data remotely.

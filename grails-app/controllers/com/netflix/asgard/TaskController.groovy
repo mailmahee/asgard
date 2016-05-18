@@ -15,21 +15,28 @@
  */
 package com.netflix.asgard
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import grails.converters.JSON
 import grails.converters.XML
+import org.apache.http.HttpStatus
 
 class TaskController {
 
     def taskService
+    ObjectMapper objectMapper
 
-    // the delete, save and update actions only accept POST requests
-    def static allowedMethods = [cancel:'POST']
+    static allowedMethods = [cancel: 'POST']
 
-    def index = { redirect(action: 'list', params:params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
-        Collection<Task> running = taskService.getRunning().reverse()
-        Collection<Task> completed = taskService.getCompleted().reverse()
+    def list() {
+        Collection<Task> runningTasks = taskService.getAllRunning()
+        Collection<Task> completedTasks = taskService.getAllCompleted()
+
+        List<Task> running = runningTasks.sort { it.startTime }.reverse()
+        List<Task> completed = completedTasks.sort { it.updateTime }.reverse().take(100)
 
         String query = params.query ?: params.id
         if (query) {
@@ -46,23 +53,23 @@ class TaskController {
         }
     }
 
-    def show = {
+    def show() {
         String id = params.id
         Task task = taskService.getTaskById(id)
         if (!task) {
             Requests.renderNotFound('Task', id, this)
-            return
         } else {
+            String updateTime = task.updateTime ? Time.format(task.updateTime) : ''
             withFormat {
                 html { return [ 'task' : task ] }
                 xml { new XML(task).render(response) }
                 json {
                     def simpleTask = [
-                            log:task.log,
+                            log: task.log,
                             status: task.status,
                             operation: task.operation,
                             durationString: task.durationString,
-                            updateTime: Time.format(task.updateTime)
+                            updateTime: updateTime
                     ]
                     render(simpleTask as JSON)
                 }
@@ -70,26 +77,57 @@ class TaskController {
         }
     }
 
-    def cancel = {
-        String id = params.id
+    def cancel(String id) {
         UserContext userContext = UserContext.of(request)
         Task task = taskService.getTaskById(id)
         if (!task) {
             Requests.renderNotFound('Task', "${id}", this)
             return
-        } else {
-            taskService.cancelTask(userContext, task)
-            flash.message = "Task '${id}:${task.name}' canceled."
         }
-
-        if (task.objectId && task.objectType) {
-            redirect(controller: task.objectType.name(), action: 'show', params: [id: task.objectId])
-        } else {
-            redirect(action: 'list')
+        taskService.cancelTask(userContext, task)
+        String message = "Task '${id}:${task.name}' canceled."
+        withFormat {
+            //noinspection GroovyAssignabilityCheck
+            form {
+                flash.message = message
+                Map redirectParams
+                if (task.objectId && task.objectType) {
+                    redirectParams = [controller: task.objectType.name(), action: 'show', params: [id: task.objectId]]
+                } else {
+                    redirectParams = [action: 'list']
+                }
+                redirect(redirectParams)
+            }
+            xml { render(contentType: 'application/xml', { result(message) }) }
+            json { render(contentType: 'application/json', { [result: message] }) }
         }
     }
 
-    def runningCount = {
-        render '' + taskService.getRunning().size()
+    def runningCount() {
+        render taskService.getLocalRunningInMemory().size().toString()
+    }
+
+    /**
+     * This JSON-only output method is intended for use by other Asgard instances that need to look up running in-memory
+     * tasks of other servers in the same cluster.
+     *
+     * @param id if specified, JSON for a single task will be returned, or a 404 if not found; otherwise a JSON array of
+     *          all Task objects will be returned
+     */
+    def runningInMemory(String id) {
+        request.withFormat {
+            json {
+                def result
+                if (id) {
+                    result = taskService.getLocalTaskById(id)
+                    if (!result) {
+                        response.status = HttpStatus.SC_NOT_FOUND
+                    }
+                } else {
+                    result = taskService.localRunningInMemory
+                }
+                render objectMapper.writer().writeValueAsString(result)
+            }
+        }
     }
 }

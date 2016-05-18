@@ -16,22 +16,30 @@
 package com.netflix.asgard
 
 import com.amazonaws.ClientConfiguration
+import com.amazonaws.auth.AWSCredentialsProvider
+import com.amazonaws.auth.BasicAWSCredentials
+import com.amazonaws.internal.StaticCredentialsProvider
 import com.amazonaws.services.autoscaling.AmazonAutoScalingClient
 import com.amazonaws.services.cloudwatch.AmazonCloudWatchClient
 import com.amazonaws.services.ec2.AmazonEC2Client
 import com.amazonaws.services.elasticloadbalancing.AmazonElasticLoadBalancingClient
 import com.amazonaws.services.rds.AmazonRDSClient
+import com.amazonaws.services.route53.AmazonRoute53Client
 import com.amazonaws.services.s3.AmazonS3Client
 import com.amazonaws.services.simpledb.AmazonSimpleDBClient
+import com.amazonaws.services.simpleworkflow.AmazonSimpleWorkflowClient
 import com.amazonaws.services.sns.AmazonSNSClient
 import com.amazonaws.services.sqs.AmazonSQSClient
+import com.netflix.asgard.cred.AsgardAWSCredentialsProviderChain
 import com.netflix.asgard.mock.MockAmazonAutoScalingClient
 import com.netflix.asgard.mock.MockAmazonCloudWatchClient
 import com.netflix.asgard.mock.MockAmazonEC2Client
 import com.netflix.asgard.mock.MockAmazonElasticLoadBalancingClient
 import com.netflix.asgard.mock.MockAmazonRDSClient
+import com.netflix.asgard.mock.MockAmazonRoute53Client
 import com.netflix.asgard.mock.MockAmazonS3Client
 import com.netflix.asgard.mock.MockAmazonSimpleDBClient
+import com.netflix.asgard.mock.MockAmazonSimpleWorkflowClient
 import com.netflix.asgard.mock.MockAmazonSnsClient
 import com.netflix.asgard.mock.MockAmazonSqsClient
 import org.springframework.beans.factory.InitializingBean
@@ -43,17 +51,18 @@ class AwsClientService implements InitializingBean {
 
     static transactional = false
 
-    def grailsApplication
-    def secretService
     def configService
+    def serverService
+    def restClientService
 
     /**
      * Interface names mapped to ClientTypes wrapper objects. For each interface name, a real and fake concrete class
      * type should be provided.
      */
-    private Map<String, Class> interfaceSimpleNamesToAwsClientClasses 
+    private Map<String, Class> interfaceSimpleNamesToAwsClientClasses
 
     private ClientConfiguration clientConfiguration
+    private AWSCredentialsProvider providerChain
 
     void afterPropertiesSet() {
         interfaceSimpleNamesToAwsClientClasses = [
@@ -63,22 +72,35 @@ class AwsClientService implements InitializingBean {
                 AmazonElasticLoadBalancing: concrete(AmazonElasticLoadBalancingClient,
                         MockAmazonElasticLoadBalancingClient),
                 AmazonRDS: concrete(AmazonRDSClient, MockAmazonRDSClient),
+                AmazonRoute53: concrete(AmazonRoute53Client, MockAmazonRoute53Client),
                 AmazonS3: concrete(AmazonS3Client, MockAmazonS3Client),
                 AmazonSimpleDB: concrete(AmazonSimpleDBClient, MockAmazonSimpleDBClient),
+                AmazonSimpleWorkflow: concrete(AmazonSimpleWorkflowClient, MockAmazonSimpleWorkflowClient),
                 AmazonSNS: concrete(AmazonSNSClient, MockAmazonSnsClient),
                 AmazonSQS: concrete(AmazonSQSClient, MockAmazonSqsClient)
         ]
         clientConfiguration = new ClientConfiguration()
         clientConfiguration.proxyHost = configService.proxyHost
         clientConfiguration.proxyPort = configService.proxyPort
+        clientConfiguration.socketTimeout = configService.socketTimeout
+        clientConfiguration.userAgent = 'asgard-' + serverService.version
+        if (configService.online) {
+            providerChain = new AsgardAWSCredentialsProviderChain(configService, restClientService)
+        } else {
+            providerChain = new StaticCredentialsProvider(new BasicAWSCredentials('a', 'b'))
+        }
     }
 
     public <T> T create(Class<T> interfaceType) {
         Class implementationType = interfaceSimpleNamesToAwsClientClasses[interfaceType.simpleName]
-        implementationType.newInstance(secretService.awsCredentials, clientConfiguration) as T
+        createImpl(implementationType)
+    }
+
+    public <T> T createImpl(Class<T> implementationType) {
+        implementationType.newInstance(providerChain, clientConfiguration) as T
     }
 
     Class concrete(Class real, Class fake) {
-        grailsApplication.config.server.online ? real : fake
+        configService.online ? real : fake
     }
 }

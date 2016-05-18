@@ -21,9 +21,8 @@ import org.apache.shiro.SecurityUtils
 class ApiTokenController {
 
     def configService
-    def secretService
 
-    def static allowedMethods = [generate: 'POST']
+    static allowedMethods = [generate: 'POST']
 
     def beforeInterceptor = {
         if (!configService.apiTokenEnabled) {
@@ -36,21 +35,26 @@ class ApiTokenController {
         }
     }
 
-    def index = { redirect(action: 'create', params: params) }
+    def index() {
+        redirect(action: 'create', params: params)
+    }
 
-    def create = { }
+    def create() {
+    }
 
-    def generate = { GenerateApiTokenCommand cmd ->
+    def generate(GenerateApiTokenCommand cmd) {
         if (cmd.hasErrors()) {
             chain(action: 'create', model:[cmd: cmd], params: params)
         } else {
             flash.apiToken = new ApiToken(cmd.purpose, cmd.email, configService.apiTokenExpirationDays,
-                    secretService.currentApiEncryptionKey)
+                    configService.currentApiEncryptionKey)
             redirect(action: 'show')
         }
     }
 
-    def show = { }
+    def show() {
+
+    }
 
 }
 

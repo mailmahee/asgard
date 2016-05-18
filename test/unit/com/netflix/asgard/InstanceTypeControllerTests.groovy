@@ -31,25 +31,20 @@ class InstanceTypeControllerTests {
 
     void testList() {
         def attrs = controller.list()
-        List<InstanceTypeData> types = attrs.instanceTypes
-        assert 15 == types.size()
-        assert 't1.micro' == types[0].name
-        InstanceTypeData m1Small = types[1]
-        assert 'M1 Small' == m1Small.hardwareProfile.description
-        assert '3.75 GiB' == types.find { it.name == 'm1.medium'}.hardwareProfile.memory
-        assert '68.4 GiB' == types.find { it.name == 'm2.4xlarge' }.hardwareProfile.memory
+        List<InstanceTypeData> types = attrs.instanceTypes.sort { it.name }
+        assert 31 <= types.size()
+        assert 'c1.medium' == types[0].name
+        InstanceTypeData m1Small = types.find { it.name == 'm1.small' }
+        assert 'Small (Default)' == m1Small.hardwareProfile.size
+        assert '3.75' == types.find { it.name == 'm1.medium' }.hardwareProfile.mem
+        assert '68.4' == types.find { it.name == 'm2.4xlarge' }.hardwareProfile.mem
         InstanceTypeData c1medium = types.find { it.name == 'c1.medium' }
-        assert '5 EC2 Compute Units (2 virtual cores with 2.5 EC2 Compute Units each)' == c1medium.hardwareProfile.cpu
-        assert '5 EC2 Compute Units' == c1medium.hardwareProfile.cpuSummary
-        assert '(2 virtual cores with 2.5 EC2 Compute Units each)' == c1medium.hardwareProfile.cpuDetail
-        assert '64-bit' == types.find { it.name == 'm1.large' }.hardwareProfile.architecture
-        assert 'Moderate' == types.find { it.name == 'm2.xlarge' }.hardwareProfile.ioPerformance
+        assert '2' == c1medium.hardwareProfile.vCpu
+        assert '64-bit' == types.find { it.name == 'm1.large' }.hardwareProfile.arch
+        assert 'Moderate' == types.find { it.name == 'm2.xlarge' }.hardwareProfile.netPerf
+        assert null == m1Small.linuxOnDemandPrice
+        assert 0.280 == types.find { it.name == 'm3.xlarge' }.linuxOnDemandPrice
 
-        assert 0.065 == m1Small.linuxOnDemandPrice
-        assert 0.03 == m1Small.linuxReservedPrice
-        assert 0.007 == m1Small.linuxSpotPrice
-        assert 0.115 == m1Small.windowsOnDemandPrice
-        assert 0.05 == m1Small.windowsReservedPrice
-        assert 0.017 == m1Small.windowsSpotPrice
+        assert 4 <= types.findAll{ it.name =~ /i2./ }.size
     }
 }

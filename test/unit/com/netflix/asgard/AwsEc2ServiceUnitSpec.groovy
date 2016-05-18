@@ -18,53 +18,129 @@ package com.netflix.asgard
 import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.ec2.AmazonEC2
 import com.amazonaws.services.ec2.model.AuthorizeSecurityGroupIngressRequest
+import com.amazonaws.services.ec2.model.DescribeInstancesRequest
+import com.amazonaws.services.ec2.model.DescribeInstancesResult
 import com.amazonaws.services.ec2.model.DescribeSecurityGroupsRequest
 import com.amazonaws.services.ec2.model.DescribeSecurityGroupsResult
 import com.amazonaws.services.ec2.model.DescribeSubnetsResult
+import com.amazonaws.services.ec2.model.GroupIdentifier
 import com.amazonaws.services.ec2.model.Instance
 import com.amazonaws.services.ec2.model.InstanceState
 import com.amazonaws.services.ec2.model.IpPermission
 import com.amazonaws.services.ec2.model.Placement
+import com.amazonaws.services.ec2.model.Reservation
 import com.amazonaws.services.ec2.model.ReservedInstances
 import com.amazonaws.services.ec2.model.RevokeSecurityGroupIngressRequest
 import com.amazonaws.services.ec2.model.SecurityGroup
 import com.amazonaws.services.ec2.model.Subnet
 import com.amazonaws.services.ec2.model.Tag
 import com.amazonaws.services.ec2.model.UserIdGroupPair
+import com.amazonaws.services.ec2.model.Vpc
 import com.google.common.collect.ImmutableList
 import com.netflix.asgard.model.SecurityGroupOption
 import com.netflix.asgard.model.SubnetData
 import com.netflix.asgard.model.SubnetTarget
 import com.netflix.asgard.model.ZoneAvailability
 import spock.lang.Specification
+import spock.lang.Unroll
 
+@SuppressWarnings("GroovyAssignabilityCheck")
 class AwsEc2ServiceUnitSpec extends Specification {
 
     UserContext userContext
     AmazonEC2 mockAmazonEC2
+    CachedMap mockVpcCache
+    CachedMap mockSubnetCache
     CachedMap mockSecurityGroupCache
     CachedMap mockInstanceCache
     CachedMap mockReservationCache
     AwsEc2Service awsEc2Service
+    ConfigService configService
+    TaskService taskService
 
     def setup() {
-        userContext = UserContext.auto(Region.US_EAST_1)
+        userContext = UserContext.auto()
         mockAmazonEC2 = Mock(AmazonEC2)
+        mockVpcCache = Mock(CachedMap)
+        mockSubnetCache = Mock(CachedMap)
         mockSecurityGroupCache = Mock(CachedMap)
         mockInstanceCache = Mock(CachedMap)
         mockReservationCache = Mock(CachedMap)
         Caches caches = new Caches(new MockCachedMapBuilder([
+                (EntityType.vpc): mockVpcCache,
+                (EntityType.subnet): mockSubnetCache,
                 (EntityType.security): mockSecurityGroupCache,
                 (EntityType.instance): mockInstanceCache,
                 (EntityType.reservation): mockReservationCache,
         ]))
-        TaskService taskService = new TaskService() {
-            def runTask(UserContext userContext, String name, Closure work, Link link = null) {
+        taskService = Spy(TaskService) {
+            runTask(_, _, _, _) >> {
+                Closure work = it[2]
                 work(new Task())
             }
         }
+        configService = Mock(ConfigService)
         awsEc2Service = new AwsEc2Service(awsClient: new MultiRegionAwsClient({ mockAmazonEC2 }), caches: caches,
-                taskService: taskService)
+                configService: configService, taskService: taskService)
+    }
+
+    @Unroll("""getInstancesWithSecurityGroup should return #instanceIds when groupId is #groupId \
+and groupName is #groupName""")
+    def 'should get the instances for a specified security group by name or id'() {
+        GroupIdentifier apiGroup = new GroupIdentifier(groupName: 'api')
+        GroupIdentifier cassGroup = new GroupIdentifier(groupName: 'cass')
+        GroupIdentifier idGroup = new GroupIdentifier(groupId: 'sg-12345678')
+        awsEc2Service = Spy(AwsEc2Service) {
+            getInstances(_) >> {
+                [
+                        new Instance(instanceId: 'i-deadbeef', securityGroups: [apiGroup, idGroup]),
+                        new Instance(instanceId: 'i-ba5eba11', securityGroups: []),
+                        new Instance(instanceId: 'i-cafebabe', securityGroups: [apiGroup, cassGroup]),
+                        new Instance(instanceId: 'i-f005ba11', securityGroups: [apiGroup]),
+                        new Instance(instanceId: 'i-ca55e77e', securityGroups: [apiGroup, cassGroup]),
+                        new Instance(instanceId: 'i-b01dface', securityGroups: [idGroup])
+                ]
+            }
+        }
+        SecurityGroup securityGroup = new SecurityGroup(groupName: groupName, groupId: groupId)
+        UserContext userContext = UserContext.auto(Region.US_WEST_1)
+
+        expect:
+        instanceIds == awsEc2Service.getInstancesWithSecurityGroup(userContext, securityGroup)*.instanceId
+
+        where:
+        groupId       | groupName | instanceIds
+        'sg-12345678' | null      | ['i-deadbeef', 'i-b01dface']
+        null          | 'api'     | ['i-deadbeef', 'i-cafebabe', 'i-f005ba11', 'i-ca55e77e']
+        null          | 'cass'    | ['i-cafebabe', 'i-ca55e77e']
+    }
+
+    def 'should get unique sorted security group name-ID combos from repetitive unsorted IDs and names'() {
+        String vampId = 'sg-1234'
+        String wolfId = 'sg-8765'
+        String ghostId = 'sg-1111'
+        String demonId = 'sg-6666'
+        awsEc2Service = Spy(AwsEc2Service) {
+            getSecurityGroups(userContext) >> {
+                [
+                        new SecurityGroup(groupName: 'vampire', groupId: vampId),
+                        new SecurityGroup(groupName: 'werewolf', groupId: wolfId),
+                        new SecurityGroup(groupName: 'demon', groupId: demonId),
+                        new SecurityGroup(groupName: 'ghost', groupId: ghostId),
+                ]
+            }
+        }
+
+        when:
+        List<String> ids = [ghostId, demonId, 'sg-abcd', 'vampire', ghostId]
+        Collection<GroupIdentifier> idObjects = awsEc2Service.getSecurityGroupNameIdPairsByNamesOrIds(userContext, ids)
+
+        then:
+        idObjects == [
+                new GroupIdentifier(groupName: 'demon', groupId: demonId),
+                new GroupIdentifier(groupName: 'ghost', groupId: ghostId),
+                new GroupIdentifier(groupName: 'vampire', groupId: vampId),
+        ]
     }
 
     def 'active instances should only include pending and running states'() {
@@ -85,7 +161,24 @@ class AwsEc2ServiceUnitSpec extends Specification {
         instances*.instanceId.sort() == ['i-grouchy', 'i-papa', 'i-smurfette']
     }
 
+    def 'should get instance reservation'() {
+
+        DescribeInstancesRequest request = new DescribeInstancesRequest().withInstanceIds('i-deadbeef')
+        Instance instance = new Instance(instanceId: 'i-deadbeef')
+        Reservation expectedRes = new Reservation(instances: [instance])
+
+        when:
+        Reservation resultRes = awsEc2Service.getInstanceReservation(userContext, 'i-deadbeef')
+
+        then:
+        resultRes == expectedRes
+        1 * mockAmazonEC2.describeInstances(request) >> new DescribeInstancesResult(reservations: [expectedRes])
+        1 * mockInstanceCache.put('i-deadbeef', instance)
+        0 * _
+    }
+
     def 'zone availabilities should sum, group, and filter reservation counts and instance counts'() {
+        configService.getReservationOfferingTypeFilters() >> []
         mockReservationCache.list() >> [
                 [instanceCount: 1, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active'],
                 [instanceCount: 10, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active'],
@@ -121,7 +214,118 @@ class AwsEc2ServiceUnitSpec extends Specification {
         ]
     }
 
+    def 'zone availabilities should sum, group, and filter reservation counts and instance counts when filtered'() {
+        configService.getReservationOfferingTypeFilters() >> ['Light Utilization']
+        mockReservationCache.list() >> [
+                [instanceCount: 1, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active',
+                 offeringType: 'Light Utilization'],
+                [instanceCount: 10, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 100, availabilityZone: 'us-east-1a', instanceType: 'm1.small', state: 'active'],
+                [instanceCount: 1000, availabilityZone: 'us-east-1b', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 10000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'retired'],
+                [instanceCount: 100000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active']
+        ].collect { new ReservedInstances(it) }
+        Placement zoneA = new Placement(availabilityZone: 'us-east-1a')
+        Placement zoneB = new Placement(availabilityZone: 'us-east-1b')
+        Placement zoneC = new Placement(availabilityZone: 'us-east-1c')
+        InstanceState running = new InstanceState(name: 'running')
+        mockInstanceCache.list() >> [
+                new Instance(instanceType: 'm2.xlarge', placement: zoneA, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneA, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneA, state: running),
+                new Instance(instanceType: 'm1.small', placement: zoneA, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneC, state: running),
+        ]
+
+        when:
+        List<ZoneAvailability> zoneAvailabilities = awsEc2Service.getZoneAvailabilities(userContext, 'm2.xlarge')
+
+        then:
+        zoneAvailabilities == [
+                new ZoneAvailability(zoneName: 'us-east-1a', totalReservations: 100010, usedReservations: 3),
+                new ZoneAvailability(zoneName: 'us-east-1b', totalReservations: 1000, usedReservations: 4),
+                new ZoneAvailability(zoneName: 'us-east-1c', totalReservations: 0, usedReservations: 1),
+        ]
+    }
+
+    def 'zone availabilities should show none instance counts when filtered by offering type'() {
+        configService.getReservationOfferingTypeFilters() >> ['Light Utilization', 'Medium Utilization']
+        mockReservationCache.list() >> [
+                [instanceCount: 1, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active',
+                 offeringType: 'Light Utilization'],
+                [instanceCount: 10, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active',
+                 offeringType: 'Medium Utilization'],
+                [instanceCount: 100, availabilityZone: 'us-east-1a', instanceType: 'm1.small', state: 'active'],
+                [instanceCount: 1000, availabilityZone: 'us-east-1b', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 10000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'retired'],
+                [instanceCount: 100000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active']
+        ].collect { new ReservedInstances(it) }
+        Placement zoneA = new Placement(availabilityZone: 'us-east-1a')
+        Placement zoneB = new Placement(availabilityZone: 'us-east-1b')
+        Placement zoneC = new Placement(availabilityZone: 'us-east-1c')
+        InstanceState running = new InstanceState(name: 'running')
+        mockInstanceCache.list() >> [
+                new Instance(instanceType: 'm2.xlarge', placement: zoneA, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneA, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneA, state: running),
+                new Instance(instanceType: 'm1.small', placement: zoneA, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneB, state: running),
+                new Instance(instanceType: 'm2.xlarge', placement: zoneC, state: running),
+        ]
+
+        when:
+        List<ZoneAvailability> zoneAvailabilities = awsEc2Service.getZoneAvailabilities(userContext, 'm2.xlarge')
+
+        then:
+        zoneAvailabilities == [
+                new ZoneAvailability(zoneName: 'us-east-1a', totalReservations: 100000, usedReservations: 3),
+                new ZoneAvailability(zoneName: 'us-east-1b', totalReservations: 1000, usedReservations: 4),
+                new ZoneAvailability(zoneName: 'us-east-1c', totalReservations: 0, usedReservations: 1),
+        ]
+    }
+
+    def 'instance reservations should be filterable'() {
+        def listOfReservations = [
+                [instanceCount: 1, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active',
+                 offeringType: 'Light Utilization'],
+                [instanceCount: 10, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 100, availabilityZone: 'us-east-1a', instanceType: 'm1.small', state: 'active'],
+                [instanceCount: 1000, availabilityZone: 'us-east-1b', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 10000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'retired'],
+                [instanceCount: 100000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active']
+        ].collect { new ReservedInstances(it) }
+        def answer = awsEc2Service.filterReservedInstancesByOffering(listOfReservations, [])
+
+        expect:
+        answer.size() == listOfReservations.size()
+    }
+
+    def 'instance reservations should be filterable by Light Utilization'() {
+        def listOfReservations = [
+                [instanceCount: 1, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active',
+                 offeringType: 'Light Utilization'],
+                [instanceCount: 10, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 100, availabilityZone: 'us-east-1a', instanceType: 'm1.small', state: 'active'],
+                [instanceCount: 1000, availabilityZone: 'us-east-1b', instanceType: 'm2.xlarge', state: 'active'],
+                [instanceCount: 10000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'retired'],
+                [instanceCount: 100000, availabilityZone: 'us-east-1a', instanceType: 'm2.xlarge', state: 'active']
+        ].collect { new ReservedInstances(it) }
+        def sizeBefore = listOfReservations.size()
+        def filteredList = awsEc2Service.filterReservedInstancesByOffering(listOfReservations, ['Light Utilization'])
+
+        expect:
+        (sizeBefore - 1) == filteredList.size()
+    }
+
     def 'zone availability should be empty if there are no reservations'() {
+        configService.getReservationOfferingTypeFilters() >> []
         mockReservationCache.list() >> []
         Placement zoneA = new Placement(availabilityZone: 'us-east-1a')
         InstanceState running = new InstanceState(name: 'running')
@@ -144,7 +348,8 @@ class AwsEc2ServiceUnitSpec extends Specification {
         actualSecurityGroup == expectedSecurityGroup
         1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupNames: ['super_secure'])) >>
                 new DescribeSecurityGroupsResult(securityGroups: [expectedSecurityGroup])
-        1 * mockSecurityGroupCache.put('super_secure', expectedSecurityGroup) >> expectedSecurityGroup
+        1 * mockSecurityGroupCache.list() >> [expectedSecurityGroup]
+        1 * mockSecurityGroupCache.put('sg-123', expectedSecurityGroup) >> expectedSecurityGroup
         0 * _
     }
 
@@ -158,8 +363,8 @@ class AwsEc2ServiceUnitSpec extends Specification {
         actualSecurityGroup == expectedSecurityGroup
         1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupIds: ['sg-123'])) >>
                 new DescribeSecurityGroupsResult(securityGroups: [expectedSecurityGroup])
-        1 * mockSecurityGroupCache.list() >> [expectedSecurityGroup]
-        1 * mockSecurityGroupCache.put('super_secure', expectedSecurityGroup) >> expectedSecurityGroup
+        1 * mockSecurityGroupCache.get('sg-123') >> expectedSecurityGroup
+        1 * mockSecurityGroupCache.put('sg-123', expectedSecurityGroup) >> expectedSecurityGroup
         0 * _
     }
 
@@ -171,7 +376,7 @@ class AwsEc2ServiceUnitSpec extends Specification {
 
         then:
         actualSecurityGroup == expectedSecurityGroup
-        1 * mockSecurityGroupCache.get('super_secure') >> expectedSecurityGroup
+        1 * mockSecurityGroupCache.list() >> [expectedSecurityGroup]
         0 * _
     }
 
@@ -183,8 +388,7 @@ class AwsEc2ServiceUnitSpec extends Specification {
 
         then:
         actualSecurityGroup == expectedSecurityGroup
-        1 * mockSecurityGroupCache.list() >> [expectedSecurityGroup]
-        1 * mockSecurityGroupCache.get('super_secure') >> expectedSecurityGroup
+        1 * mockSecurityGroupCache.get('sg-123') >> expectedSecurityGroup
         0 * _
     }
 
@@ -194,12 +398,11 @@ class AwsEc2ServiceUnitSpec extends Specification {
 
         then:
         actualSecurityGroup == null
-        1 * mockSecurityGroupCache.list() >> []
-        1 * mockSecurityGroupCache.get(null)
+        1 * mockSecurityGroupCache.get('sg-123')
         0 * _
     }
 
-    def 'should put null in cache by name when security group is not found by name'() {
+    def 'should put null in cache when security group is not found by name'() {
         when:
         SecurityGroup actualSecurityGroup = awsEc2Service.getSecurityGroup(userContext, 'super_secure')
 
@@ -208,34 +411,21 @@ class AwsEc2ServiceUnitSpec extends Specification {
         1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupNames: ['super_secure'])) >> {
             throw new AmazonServiceException('there is no security group like that')
         }
-        1 * mockSecurityGroupCache.put('super_secure', null)
+        1 * mockSecurityGroupCache.list() >> []
         0 * _
     }
 
-    def 'should put null in cache by name when security group is not found by id'() {
+    def 'should put null in cache when security group is not found by id'() {
         when:
         SecurityGroup actualSecurityGroup = awsEc2Service.getSecurityGroup(userContext, 'sg-123')
 
         then:
         null == actualSecurityGroup
+        1 * mockSecurityGroupCache.get('sg-123')
         1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupIds: ['sg-123'])) >> {
             throw new AmazonServiceException('there is no security group like that')
         }
-        1 * mockSecurityGroupCache.list() >> [new SecurityGroup(groupId: 'sg-123', groupName: 'super_secure')]
-        1 * mockSecurityGroupCache.put('super_secure', null)
-        0 * _
-    }
-
-    def 'should put nothing in cache when security group is not found by id or in cache'() {
-        when:
-        SecurityGroup actualSecurityGroup =  awsEc2Service.getSecurityGroup(userContext, 'sg-123')
-
-        then:
-        null == actualSecurityGroup
-        1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupIds: ['sg-123'])) >> {
-            throw new AmazonServiceException('there is no security group like that')
-        }
-        1 * mockSecurityGroupCache.list() >> [new SecurityGroup(groupId: 'sg-000', groupName: 'super_secure')]
+        1 * mockSecurityGroupCache.put('sg-123', null)
         0 * _
     }
 
@@ -247,16 +437,16 @@ class AwsEc2ServiceUnitSpec extends Specification {
         SecurityGroup actualSecurityGroup =  awsEc2Service.getSecurityGroup(userContext, 'super_secure')
 
         then:
-        null == actualSecurityGroup
+        securityGroup == actualSecurityGroup
+        1 * mockSecurityGroupCache.list() >> [securityGroup]
         1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupNames: ['super_secure'])) >> {
             AmazonServiceException e = new AmazonServiceException('you cannot ask for a VPC Security Group by name')
             e.errorCode = 'InvalidParameterValue'
             throw e
         }
-        1 * mockSecurityGroupCache.get('super_secure') >> securityGroup
         1 * mockAmazonEC2.describeSecurityGroups(new DescribeSecurityGroupsRequest(groupIds: ['sg-123'])) >>
-                new DescribeSecurityGroupsResult(securityGroups: [securityGroup])
-        1 * mockSecurityGroupCache.put('super_secure', securityGroup)
+            new DescribeSecurityGroupsResult(securityGroups: [securityGroup])
+        1 * mockSecurityGroupCache.put('sg-123', securityGroup) >> securityGroup
         0 * _
     }
 
@@ -271,7 +461,7 @@ class AwsEc2ServiceUnitSpec extends Specification {
             e.errorCode = 'NotInvalidParameterValue'
             throw e
         }
-        1 * mockSecurityGroupCache.put('super_secure', null)
+        1 * mockSecurityGroupCache.list()
         0 * _
     }
 
@@ -286,7 +476,8 @@ class AwsEc2ServiceUnitSpec extends Specification {
             e.errorCode = 'InvalidParameterValue'
             throw e
         }
-        1 * mockSecurityGroupCache.list() >> []
+        1 * mockSecurityGroupCache.get('sg-123')
+        1 * mockSecurityGroupCache.put('sg-123', null)
         0 * _
     }
 
@@ -313,19 +504,20 @@ class AwsEc2ServiceUnitSpec extends Specification {
         then:
         1 * mockAmazonEC2.describeSubnets() >> new DescribeSubnetsResult(subnets: subnets)
         ImmutableList.copyOf(awsEc2Service.getSubnets(userContext).allSubnets) == [
+                new SubnetData(subnetId: 'subnet-e9b0a3a4', availabilityZone: 'us-east-1a', purpose: 'external',
+                    target: SubnetTarget.ELB),
                 new SubnetData(subnetId: 'subnet-e9b0a3a1', availabilityZone: 'us-east-1a', purpose: 'internal',
                         target: SubnetTarget.EC2),
-                new SubnetData(subnetId: 'subnet-e9b0a3a4', availabilityZone: 'us-east-1a', purpose: 'external',
-                        target: SubnetTarget.ELB),
         ]
+        0 * _
     }
 
     private Collection<SecurityGroup> simulateWarGames() {
         SecurityGroupDsl.config {
-            wopr(7101, 7102) >> norad
-            joshua(7101, 7102) >> [wopr, globalthermonuclearwar, tictactoe]
-            modem(8080, 8080) >> joshua
-            falken(7101, 7102) >> joshua
+            wopr(7101, 7102) withIngress norad
+            joshua(7101, 7102) withIngress([wopr, globalthermonuclearwar, tictactoe])
+            modem(8080, 8080) withIngress joshua
+            falken(7101, 7102) withIngress joshua
         }
     }
 
@@ -348,6 +540,7 @@ class AwsEc2ServiceUnitSpec extends Specification {
                 new SecurityGroupOption('wopr', 'joshua', false, '7001'),
         ]
         1 * mockSecurityGroupCache.list() >> { warGamesSecurityGroups }
+        0 * _
     }
 
     def 'options for source group should include all groups sorted, but only some allowed to be called by source'() {
@@ -369,23 +562,25 @@ class AwsEc2ServiceUnitSpec extends Specification {
                 new SecurityGroupOption('joshua', 'wopr', true, '7101-7102'),
         ]
         1 * mockSecurityGroupCache.list() >> { simulateWarGames() }
+        0 * _
     }
 
-    def 'should update security groups'() {
+    def 'should update security group ingress permissions with auth and revoke but only one task run'() {
         List<UserIdGroupPair> userIdGroupPairs = [new UserIdGroupPair(groupId: 'sg-s')]
-        SecurityGroup source = new SecurityGroup(groupName: 'source', groupId: 'sg-s')
-        SecurityGroup target = new SecurityGroup(groupName: 'target', groupId: 'sg-t', ipPermissions: [
-                new IpPermission(fromPort: 1, toPort: 1, userIdGroupPairs: userIdGroupPairs),
-                new IpPermission(fromPort: 2, toPort: 2, userIdGroupPairs: userIdGroupPairs),
+        SecurityGroup source = new SecurityGroup(groupId: 'sg-s')
+        SecurityGroup target = new SecurityGroup(groupId: 'sg-t', ipPermissions: [
+                new IpPermission(ipProtocol: 'tcp', fromPort: 1, toPort: 1, userIdGroupPairs: userIdGroupPairs),
+                new IpPermission(ipProtocol: 'tcp', fromPort: 2, toPort: 2, userIdGroupPairs: userIdGroupPairs),
         ])
 
         when:
         awsEc2Service.updateSecurityGroupPermissions(userContext, target, source, [
-                new IpPermission(fromPort: 2, toPort: 2),
-                new IpPermission(fromPort: 3, toPort: 3),
+                new IpPermission(ipProtocol: 'tcp', fromPort: 2, toPort: 2),
+                new IpPermission(ipProtocol: 'tcp', fromPort: 3, toPort: 3)
         ])
 
         then:
+        1 * configService.getAwsAccountNumber()
         1 * mockAmazonEC2.authorizeSecurityGroupIngress(new AuthorizeSecurityGroupIngressRequest(groupId: 'sg-t',
                 ipPermissions: [
                         new IpPermission(fromPort: 3, toPort: 3, ipProtocol: 'tcp', userIdGroupPairs: userIdGroupPairs),
@@ -396,6 +591,52 @@ class AwsEc2ServiceUnitSpec extends Specification {
                 ]))
         1 * mockAmazonEC2.describeSecurityGroups(_) >> new DescribeSecurityGroupsResult(
                 securityGroups: [new SecurityGroup()])
+        1 * taskService.runTask(_, _, _, _) >> {
+            Closure work = it[2]
+            work(new Task())
+        }
+        1 * mockSecurityGroupCache.list()
         0 * _
+    }
+
+    def 'should get subnet IDs for default VPC'() {
+
+        when:
+        List<String> subnetIds = awsEc2Service.getDefaultVpcSubnetIds(UserContext.auto())
+
+        then:
+        subnetIds == ['subnet-luke', 'subnet-han']
+        2 * mockVpcCache.list() >> [new Vpc(vpcId: 'vpc-123'), new Vpc(vpcId: 'vpc-789', isDefault: true)]
+        1 * mockSubnetCache.list() >> [
+                new Subnet(subnetId: 'subnet-luke', vpcId: 'vpc-789'),
+                new Subnet(subnetId: 'subnet-han', vpcId: 'vpc-789'),
+                new Subnet(subnetId: 'subnet-vader', vpcId: 'vpc-123'),
+                new Subnet(subnetId: 'subnet-palpatine', vpcId: 'vpc-123')
+        ]
+        0 * _
+    }
+
+    def 'should get zero subnet IDs for default VPC if no default VPC exists'() {
+
+        when:
+        List<String> subnetIds = awsEc2Service.getDefaultVpcSubnetIds(UserContext.auto())
+
+        then:
+        subnetIds == []
+        1 * mockVpcCache.list() >> [new Vpc(vpcId: 'vpc-123')]
+        0 * _
+    }
+
+    def 'should convert two port numbers to a port range string'(){
+        expect:
+        '7001-7002' == AwsEc2Service.portString(7001, 7002)
+        '7001' == AwsEc2Service.portString(7001, 7001)
+    }
+
+    def 'should convert a comma-delimited string of port ranges to port-populated IpPermission objects'() {
+        expect:
+        [
+                new IpPermission(fromPort: 7001, toPort: 7001), new IpPermission(fromPort: 7101, toPort: 7102)
+        ] == AwsEc2Service.permissionsFromString('7001,7101-7102')
     }
 }

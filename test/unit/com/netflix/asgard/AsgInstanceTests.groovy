@@ -17,22 +17,20 @@ package com.netflix.asgard
 
 import com.amazonaws.services.autoscaling.model.Instance
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
-import com.netflix.asgard.mock.Mocks
 
 class AsgInstanceTests extends GroovyTestCase {
 
     void testCopy() {
 
-        Mocks.createDynamicMethods() 
+        new MonkeyPatcherService().createDynamicMethods()
 
-        Mocks.awsAutoScalingService()
-
-        Instance original = new Instance().withInstanceId("i-test").withAvailabilityZone("us-east-1d").withLifecycleState("running")
+        Instance original = new Instance().withInstanceId("i-test").withAvailabilityZone("us-east-1d").
+                withLifecycleState("running")
 
         Instance copy = original.copy()
 
         assert !copy.is(original)
-        assert copy.equals(original)
+        assert copy == original
 
         copy.setAvailabilityZone "us-east-1c"
         assert copy.getAvailabilityZone() == "us-east-1c"

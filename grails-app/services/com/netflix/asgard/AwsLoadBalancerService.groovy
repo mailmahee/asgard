@@ -17,23 +17,28 @@ package com.netflix.asgard
 
 import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
+import com.amazonaws.services.ec2.model.SecurityGroup
 import com.amazonaws.services.elasticloadbalancing.AmazonElasticLoadBalancing
 import com.amazonaws.services.elasticloadbalancing.model.AttachLoadBalancerToSubnetsRequest
 import com.amazonaws.services.elasticloadbalancing.model.ConfigureHealthCheckRequest
 import com.amazonaws.services.elasticloadbalancing.model.CreateLoadBalancerListenersRequest
 import com.amazonaws.services.elasticloadbalancing.model.CreateLoadBalancerRequest
+import com.amazonaws.services.elasticloadbalancing.model.CrossZoneLoadBalancing
 import com.amazonaws.services.elasticloadbalancing.model.DeleteLoadBalancerListenersRequest
 import com.amazonaws.services.elasticloadbalancing.model.DeleteLoadBalancerRequest
 import com.amazonaws.services.elasticloadbalancing.model.DeregisterInstancesFromLoadBalancerRequest
 import com.amazonaws.services.elasticloadbalancing.model.DescribeInstanceHealthRequest
 import com.amazonaws.services.elasticloadbalancing.model.DescribeLoadBalancersRequest
+import com.amazonaws.services.elasticloadbalancing.model.DescribeLoadBalancersResult
 import com.amazonaws.services.elasticloadbalancing.model.DetachLoadBalancerFromSubnetsRequest
 import com.amazonaws.services.elasticloadbalancing.model.DisableAvailabilityZonesForLoadBalancerRequest
 import com.amazonaws.services.elasticloadbalancing.model.EnableAvailabilityZonesForLoadBalancerRequest
 import com.amazonaws.services.elasticloadbalancing.model.Instance
 import com.amazonaws.services.elasticloadbalancing.model.InstanceState
 import com.amazonaws.services.elasticloadbalancing.model.Listener
+import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerAttributes
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
+import com.amazonaws.services.elasticloadbalancing.model.ModifyLoadBalancerAttributesRequest
 import com.amazonaws.services.elasticloadbalancing.model.RegisterInstancesWithLoadBalancerRequest
 import com.amazonaws.services.elasticloadbalancing.model.SourceSecurityGroup
 import com.google.common.collect.ArrayListMultimap
@@ -42,6 +47,7 @@ import com.netflix.asgard.cache.CacheInitializer
 import com.netflix.asgard.model.InstanceStateData
 import com.netflix.asgard.model.SubnetTarget
 import com.netflix.asgard.model.Subnets
+import com.netflix.asgard.retriever.AwsResultsRetriever
 import org.springframework.beans.factory.InitializingBean
 
 class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
@@ -84,8 +90,28 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
 
     // Load Balancers
 
+    final AwsResultsRetriever loadBalancerRetriever = new AwsResultsRetriever<LoadBalancerDescription,
+    DescribeLoadBalancersRequest, DescribeLoadBalancersResult>() {
+        @Override
+        protected DescribeLoadBalancersResult makeRequest(Region region, DescribeLoadBalancersRequest request) {
+            awsClient.by(region).describeLoadBalancers(request)
+        }
+        @Override
+        protected List<LoadBalancerDescription> accessResult(DescribeLoadBalancersResult result) {
+            result.loadBalancerDescriptions
+        }
+        @Override
+        protected void setNextToken(DescribeLoadBalancersRequest request, String nextToken) {
+            request.withMarker(nextToken)
+        }
+        @Override
+        protected String getNextToken(DescribeLoadBalancersResult result) {
+            result.nextMarker
+        }
+    }
+
     private List<LoadBalancerDescription> retrieveLoadBalancers(Region region) {
-        awsClient.by(region).describeLoadBalancers(new DescribeLoadBalancersRequest()).getLoadBalancerDescriptions()
+        loadBalancerRetriever.retrieve(region, new DescribeLoadBalancersRequest())
     }
 
     Collection<LoadBalancerDescription> getLoadBalancers(UserContext userContext) {
@@ -95,6 +121,19 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
     List<LoadBalancerDescription> getLoadBalancersForApp(UserContext userContext, String appName) {
         getLoadBalancers(userContext).findAll {
             Relationships.appNameFromLaunchConfigName(it.loadBalancerName) == appName
+        }
+    }
+
+    /**
+     * Finds all the load balancers with the specified security group.
+     *
+     * @param userContext who, where, why
+     * @param group the security group for which to find associated load balancers
+     * @return the load balancers that have the specified security group
+     */
+    List<LoadBalancerDescription> getLoadBalancersWithSecurityGroup(UserContext userContext, SecurityGroup group) {
+        getLoadBalancers(userContext).findAll {
+            group.groupName in it.securityGroups || group.groupId in it.securityGroups
         }
     }
 
@@ -123,7 +162,7 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
 
     List<LoadBalancerDescription> getLoadBalancersFor(UserContext userContext, String instanceId) {
         if (!instanceId) { return [] }
-        getLoadBalancers(userContext).findAll { it.instances.any { it.instanceId == instanceId }}
+        getLoadBalancers(userContext).findAll { it.instances.any { it.instanceId == instanceId } }
     }
 
     Map<String, Collection<LoadBalancerDescription>> mapInstanceIdsToLoadBalancers(UserContext userContext,
@@ -136,12 +175,14 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
             }
         }
         Map<String, Collection<LoadBalancerDescription>> result = instanceIdsToLoadBalancers.asMap().subMap(instanceIds)
-        // subMap() puts missing keys as null values, we want them initialized as empty lists
-        result.each { key, value ->
-            if (value == null) {
-                result[key] = []
+        // subMap() omits missing keys, we want them initialized as empty lists
+        for (String instanceId : instanceIds) {
+            // will deal with missing key and the scenario where the value is null
+            if (!result[instanceId]) {
+                result[instanceId] = []
             }
         }
+        result
     }
 
     /**
@@ -197,7 +238,11 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
             } else {
                 request.withAvailabilityZones(zoneList)
             }
-            awsClient.by(userContext.region).createLoadBalancer(request)  // has result
+            def client = awsClient.by(userContext.region)
+            client.createLoadBalancer(request)
+            def modifyRequest = new ModifyLoadBalancerAttributesRequest(loadBalancerName: name, loadBalancerAttributes:
+                    new LoadBalancerAttributes(crossZoneLoadBalancing: new CrossZoneLoadBalancing(enabled: true)))
+            client.modifyLoadBalancerAttributes(modifyRequest)
         }, Link.to(EntityType.loadBalancer, name))
         getLoadBalancer(userContext, name)
     }
@@ -252,7 +297,7 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
     }
 
     void removeLoadBalancer(UserContext userContext, String name) {
-        taskService.runTask(userContext, "RemoveLoad Balancer ${name}", { task ->
+        taskService.runTask(userContext, "Remove Load Balancer ${name}", { task ->
             def request = new DeleteLoadBalancerRequest()
                     .withLoadBalancerName(name)
             awsClient.by(userContext.region).deleteLoadBalancer(request)  // no result
@@ -278,7 +323,7 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
                                          Task existingTask = null) {
         // Limit rate of instance changes to avoid Amazon limitation.
         taskService.runTask(userContext, "Add instances ${instanceIds} to Load Balancer ${name}", { Task task ->
-            def instances = instanceIds.collect { new Instance().withInstanceId(it) } // elasticloadbalancing.model.Instance type
+            def instances = instanceIds.collect { new Instance().withInstanceId(it) }
             RegisterInstancesWithLoadBalancerRequest request = new RegisterInstancesWithLoadBalancerRequest()
                     .withLoadBalancerName(name)
                     .withInstances(instances)
@@ -300,7 +345,7 @@ class AwsLoadBalancerService implements CacheInitializer, InitializingBean {
             if (!instanceIdsToDeregister) {
                 return
             }
-            List<Instance> instances = instanceIdsToDeregister.collect { new Instance().withInstanceId(it) } // elasticloadbalancing.model.Instance type
+            List<Instance> instances = instanceIdsToDeregister.collect { new Instance().withInstanceId(it) }
             DeregisterInstancesFromLoadBalancerRequest request = new DeregisterInstancesFromLoadBalancerRequest()
             request.withLoadBalancerName(name).withInstances(instances)
             task.tryUntilSuccessful(

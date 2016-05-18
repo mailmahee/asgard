@@ -40,7 +40,9 @@ class PushService {
 
     def awsAutoScalingService
     def awsEc2Service
+    def awsSimpleWorkflowService
     def configService
+    def flowService
     def imageService
     def instanceTypeService
     def restClientService
@@ -123,7 +125,7 @@ class PushService {
     }
 
     /** Run processing that is common to multiple edit screens for preparing a push. */
-    Map prepareEdit(UserContext userContext, String groupName, boolean showAllImages, String actionName,
+    Map<String, Object> prepareEdit(UserContext userContext, String groupName, boolean showAllImages,
                     Collection<String> selectedSecurityGroups) {
         String name = groupName
 
@@ -147,16 +149,14 @@ class PushService {
         Boolean imageListIsShort = images.size() < fullCount
         Subnets subnets = awsEc2Service.getSubnets(userContext)
         List<SecurityGroup> effectiveSecurityGroups = awsEc2Service.getEffectiveSecurityGroups(userContext)
-        List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(group.VPCZoneIdentifier)
-        String vpcId = subnets.coerceLoneOrNoneFromIds(subnetIds)?.vpcId
+        String vpcId = subnets.getVpcIdForVpcZoneIdentifier(group.VPCZoneIdentifier)
         Map<String, String> purposeToVpcId = subnets.mapPurposeToVpcId()
         String pricing = lc.spotPrice ? InstancePriceType.SPOT.name() : InstancePriceType.ON_DEMAND.name()
-        Map result = [
+        Map<String, Object> result = [
                 appName: appName,
                 name: name,
                 cluster: Relationships.clusterFromGroupName(name),
                 variables: Relationships.parts(name),
-                actionName: actionName,
                 allTerminationPolicies: awsAutoScalingService.terminationPolicyTypes,
                 terminationPolicy: group.terminationPolicies[0],
 
@@ -181,6 +181,7 @@ class PushService {
                 afterBootWait: 30,
                 rudeShutdown: false,
                 pricing: pricing,
+                spotUrl: configService.spotUrl
         ]
         result
     }

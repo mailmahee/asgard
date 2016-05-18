@@ -26,9 +26,11 @@ class DbSnapshotController {
 
     def awsRdsService
 
-    def index = { redirect(action: 'list', params:params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         List<DBSnapshot> dbSnapshots = awsRdsService.getDBSnapshots(userContext).sort { it.getDBSnapshotIdentifier() }
         withFormat {
@@ -38,25 +40,26 @@ class DbSnapshotController {
         }
     }
 
-    def create = { CreateDBSnapshotCommand cmd ->
+    def create(CreateDBSnapshotCommand cmd) {
         UserContext userContext = UserContext.of(request)
         if (cmd.hasErrors()) {
             flash.message = "DB Snapshot name may not be blank."
-            redirect(controller:"rdsInstance", action:'show', params:[name:params.dBInstanceIdentifier])
+            redirect(controller: "rdsInstance", action: 'show', params: [name: params.dBInstanceIdentifier])
         } else {
             awsRdsService.createDBSnapshot(userContext, params.dBInstanceIdentifier, params.snapshotName)
             redirect(action: 'show', params: [name: params.snapshotName])
         }
     }
 
-    def quickRestore = { RestoreDBCommand cmd ->
+    def quickRestore(RestoreDBCommand cmd) {
         UserContext userContext = UserContext.of(request)
         if (cmd.hasErrors()) {
             flash.message = "DB Instance name may not be blank."
             redirect(action: 'list')
         } else {
             try {
-                DBInstance instance = awsRdsService.restoreFromSnapshot(userContext, params.name, params.dBInstanceIdentifier)
+                DBInstance instance = awsRdsService.restoreFromSnapshot(userContext, params.name,
+                        params.dBInstanceIdentifier)
                 String identifier = instance.getDBInstanceIdentifier()
                 redirect(controller: "rdsInstance", action: 'show', params: [dBInstanceIdentifier: identifier])
             } catch (Exception e) {
@@ -66,7 +69,7 @@ class DbSnapshotController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         def name = params.name ?: params.id
         DBSnapshot snapshot = awsRdsService.getDBSnapshot(userContext, name)
@@ -83,18 +86,19 @@ class DbSnapshotController {
         }
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
         def snapshotIds = []
-        if (params.dBSnapshotIdentifier) snapshotIds << params.dBSnapshotIdentifier
-        if (params.selectedSnapshots) {
-            snapshotIds.addAll ((params.selectedSnapshots instanceof String) ? [params.selectedSnapshots] : params.selectedSnapshots as List)
+        if (params.dBSnapshotIdentifier) { snapshotIds << params.dBSnapshotIdentifier }
+        def selectedSnapshots = params.selectedSnapshots
+        if (selectedSnapshots) {
+            snapshotIds.addAll ((selectedSnapshots instanceof String) ? [selectedSnapshots] : selectedSnapshots as List)
         }
 
         def message = ""
         try {
             def deletedCount = 0
-            snapshotIds.each{
+            snapshotIds.each {
                 awsRdsService.deleteDBSnapshot(userContext, it)
                 message += (deletedCount > 0) ? ", $it" : "Snapshot(s) deleted: $it"
                 deletedCount++
@@ -111,13 +115,13 @@ class DbSnapshotController {
 class CreateDBSnapshotCommand {
     String snapshotName
     static constraints = {
-        snapshotName(blank:false)
+        snapshotName(blank: false)
     }
 }
 
 class RestoreDBCommand {
     String dBInstanceIdentifier
     static constraints = {
-        dBInstanceIdentifier(blank:false)
+        dBInstanceIdentifier(blank: false)
     }
 }

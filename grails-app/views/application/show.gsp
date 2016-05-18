@@ -53,6 +53,10 @@
           </td>
         </tr>
         <tr class="prop">
+          <td class="name">App Group:</td>
+          <td class="value">${app.group}</td>
+        </tr>
+        <tr class="prop">
           <td class="name">Type:</td>
           <td class="value">${app.type}</td>
         </tr>
@@ -72,6 +76,10 @@
           <td class="name">Monitor Bucket Type:</td>
           <td class="value">${app.monitorBucketType.description}</td>
         </tr>
+          <tr class="prop">
+            <td class="name">Chaos Monkey:</td>
+            <td class="value"><a class="chaosMonkey" href="${chaosMonkeyEditLink}">Edit in Monkey-Commander</a></td>
+          </tr>
         <tr class="prop">
           <td class="name">Create Time:</td>
           <td class="value"><g:formatDate date="${app.createTime}"/></td>
@@ -80,6 +88,18 @@
           <td class="name">Update Time:</td>
           <td class="value"><g:formatDate date="${app.updateTime}"/></td>
         </tr>
+        <g:if test="${app.tags}">
+          <tr class="prop">
+            <td class="name">Tags:</td>
+            <td class="value">
+              <g:each in="${app.tags}" var="tag">
+                <span class="label">
+                  <g:link action="list" params="[id: tag]">${tag}</g:link>
+                </span>
+              </g:each>
+            </td>
+          </tr>
+        </g:if>
         <g:if test="${alertingServiceConfigUrl}">
           <tr class="prop">
             <td class="name">
@@ -132,7 +152,7 @@
             <table>
               <g:each var="s" in="${securities}">
                 <tr>
-                  <td><g:linkObject type="security" name="${s.groupId}">${s.groupName}</g:linkObject></td>
+                  <td><g:securityGroup group="${s}"/></td>
                 </tr>
               </g:each>
             </table>

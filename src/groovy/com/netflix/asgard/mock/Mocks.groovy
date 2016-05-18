@@ -35,11 +35,16 @@ import com.netflix.asgard.AwsSqsService
 import com.netflix.asgard.CachedMapBuilder
 import com.netflix.asgard.Caches
 import com.netflix.asgard.ConfigService
-import com.netflix.asgard.DefaultUserDataProvider
+import com.netflix.asgard.applications.SimpleDBApplicationService
+import com.netflix.asgard.userdata.DefaultUserDataProvider
 import com.netflix.asgard.DiscoveryService
+import com.netflix.asgard.DnsService
 import com.netflix.asgard.EmailerService
+import com.netflix.asgard.EnvironmentService
+import com.netflix.asgard.EurekaAddressCollectorService
 import com.netflix.asgard.FastPropertyService
 import com.netflix.asgard.FlagService
+import com.netflix.asgard.IdService
 import com.netflix.asgard.InstanceTypeService
 import com.netflix.asgard.LaunchTemplateService
 import com.netflix.asgard.Link
@@ -50,17 +55,18 @@ import com.netflix.asgard.MultiRegionAwsClient
 import com.netflix.asgard.PushService
 import com.netflix.asgard.Region
 import com.netflix.asgard.RestClientService
-import com.netflix.asgard.SecretService
+import com.netflix.asgard.ServerService
 import com.netflix.asgard.SimpleDbDomainService
 import com.netflix.asgard.StackService
 import com.netflix.asgard.Task
 import com.netflix.asgard.TaskService
 import com.netflix.asgard.ThreadScheduler
+import com.netflix.asgard.Time
 import com.netflix.asgard.UserContext
 import com.netflix.asgard.cache.Fillable
-import com.netflix.asgard.format.JsonpStripper
 import com.netflix.asgard.model.HardwareProfile
 import com.netflix.asgard.model.InstanceTypeData
+import com.netflix.asgard.model.SimpleDbSequenceLocator
 import com.netflix.asgard.plugin.UserDataProvider
 import grails.converters.JSON
 import grails.converters.XML
@@ -68,60 +74,21 @@ import grails.test.MockUtils
 import groovy.util.slurpersupport.GPathResult
 import javax.servlet.http.HttpServletRequest
 import org.codehaus.groovy.grails.web.json.JSONArray
-import org.codehaus.groovy.grails.web.json.JSONElement
 import org.joda.time.format.ISODateTimeFormat
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 import org.springframework.mock.web.MockHttpServletRequest
 
 class Mocks {
 
-    private static Map<String, JSONElement> fileNamesToJsonDocuments = [:]
-    private static Map<String, Document> fileNamesToHtmlDocuments = [:]
     static final String TEST_AWS_ACCOUNT_ID = '179000000000'
     static final String PROD_AWS_ACCOUNT_ID = '149000000000'
     static final String SEG_AWS_ACCOUNT_ID = '119000000000'
-
-    private static InputStream getFileAsStream(String fileName) {
-        Mocks.class.classLoader.getResourceAsStream("com/netflix/asgard/mock/${fileName}")
-    }
-
-    static Document parseHtmlFile(String fileName) {
-        if (fileNamesToHtmlDocuments[fileName] == null) {
-            InputStream stream = getFileAsStream(fileName)
-            if (!stream) {
-                throw new IllegalStateException("Unable to read file ${fileName}.")
-            }
-            Document document = Jsoup.parse(stream, 'UTF-8', '/')
-            fileNamesToHtmlDocuments[fileName] = document
-        }
-        fileNamesToHtmlDocuments[fileName]
-    }
-
-    static JSONElement parseJsonFile(String fileName) {
-        if (fileNamesToJsonDocuments[fileName] == null) {
-            InputStream stream = getFileAsStream(fileName)
-            if (!stream) {
-                throw new IllegalStateException("""Unable to read file ${fileName}.
-  If you are running tests in IntelliJ you must add "js" and "json" as file extensions for the compiler.
-  Open Preferences, click Compiler, add json and txt to Resource Patterns:
-  '?*.properties;?*.xml;?*.gif;?*.png;?*.jpeg;?*.jpg;?*.html;?*.dtd;?*.tld;?*.ftl;?*.txt;?*.json;?*.js'""")
-            }
-
-            // Get the content as a string instead of a stream. Strip padding off JSONP if present.
-            String content = new JsonpStripper(stream.getText()).stripPadding()
-            JSONElement data = JSON.parse(content)
-            fileNamesToJsonDocuments[fileName] = data
-        }
-        fileNamesToJsonDocuments[fileName]
-    }
 
     static JSONArray parseJsonString(String jsonData) {
         JSON.parse(jsonData) as JSONArray
     }
 
     static String jsonNullable(def jsonValue) {
-        jsonValue?.toString() != 'null' ? jsonValue.toString() : null
+        jsonValue?.toString() == 'null' ? null : jsonValue?.toString()
     }
 
     /**
@@ -139,8 +106,8 @@ class Mocks {
             monkeyPatcherService()
     }
 
-    private static def grailsApplication
-    static def grailsApplication() {
+    private static grailsApplication
+    static grailsApplication() {
         if (grailsApplication == null) {
             grailsApplication = [
                     config: [
@@ -151,7 +118,7 @@ class Mocks {
                                             new InstanceTypeData(linuxOnDemandPrice: 145.86, hardwareProfile:
                                                     new HardwareProfile(
                                                             instanceType: 'huge.mainframe',
-                                                            architecture: '64-bit')
+                                                            arch: '64-bit')
                                             )],
                                     defaultKeyName: 'nf-test-keypair-a',
                                     defaultSecurityGroups: ['nf-datacenter', 'nf-infrastructure'],
@@ -167,17 +134,18 @@ class Mocks {
                             ],
                             email: [:],
                             grails: [
-                                    awsAccountNames: [(TEST_AWS_ACCOUNT_ID): 'test', (PROD_AWS_ACCOUNT_ID): 'prod', (SEG_AWS_ACCOUNT_ID): 'seg'],
+                                    awsAccountNames: [(TEST_AWS_ACCOUNT_ID): 'test', (PROD_AWS_ACCOUNT_ID): 'prod',
+                                            (SEG_AWS_ACCOUNT_ID): 'seg'],
                                     awsAccounts: [TEST_AWS_ACCOUNT_ID, PROD_AWS_ACCOUNT_ID]
                             ],
                             promote: [
-                                    targetServer: 'http://prod',
                                     imageTags: true,
                                     canonicalServerForBakeEnvironment: 'http://test'
                             ],
                             server: [:],
                             thread: [useJitter: false]
-                    ]
+                    ],
+                    metadata: [:]
             ]
         }
         grailsApplication
@@ -191,8 +159,8 @@ class Mocks {
         caches
     }
 
-    private static def monkeyPatcherService
-    static def monkeyPatcherService() {
+    private static MonkeyPatcherService monkeyPatcherService
+    static MonkeyPatcherService monkeyPatcherService() {
         if (monkeyPatcherService == null) {
             MockUtils.mockLogging(MonkeyPatcherService, false)
             monkeyPatcherService = new MonkeyPatcherService()
@@ -205,15 +173,8 @@ class Mocks {
     private static ApplicationService applicationService
     static ApplicationService applicationService() {
         if (applicationService == null) {
-            MockUtils.mockLogging(ApplicationService, false)
-            applicationService = new ApplicationService()
-            applicationService.caches = caches()
-            applicationService.grailsApplication = grailsApplication()
-            applicationService.configService = configService()
-            applicationService.awsClientService = awsClientService()
-
             List<String> names =
-                    ['abcache', 'api', 'aws_stats', 'cryptex', 'helloworld', 'ntsuiboot', 'videometadata'].asImmutable()
+                ['abcache', 'api', 'aws_stats', 'cryptex', 'helloworld', 'ntsuiboot', 'videometadata'].asImmutable()
             List<AppRegistration> apps = names.collect({ AppRegistration.from(item(it.toUpperCase())) }).asImmutable()
 
             // Populate map of names to apps
@@ -221,9 +182,22 @@ class Mocks {
             apps.eachWithIndex { app, index -> namesToApps[names[index]] = app }
             namesToApps = namesToApps.asImmutable()
 
-            applicationService.metaClass.getRegisteredApplications = { UserContext userContext -> apps }
-            applicationService.metaClass.getRegisteredApplication = { UserContext userContext, String name -> namesToApps[name] }
+            MockUtils.mockLogging(SimpleDBApplicationService, false)
+            applicationService = new SimpleDBApplicationService() {
+                @Override
+                List<AppRegistration> getRegisteredApplications(UserContext userContext) {
+                    return apps
+                }
 
+                @Override
+                AppRegistration getRegisteredApplication(UserContext userContext, String nameInput) {
+                    return namesToApps[nameInput]
+                }
+            }
+            applicationService.caches = caches()
+            applicationService.configService = configService()
+            applicationService.awsClientService = awsClientService()
+            applicationService.awsSimpleDbService = awsSimpleDbService()
             applicationService.afterPropertiesSet()
             applicationService.initializeCaches()
 
@@ -233,7 +207,7 @@ class Mocks {
         applicationService
     }
 
-    private static def item(String name) {
+    private static Item item(String name) {
         new Item().withName(name).withAttributes(
                 [new Attribute('createTs', '1279755598817'), new Attribute('updateTs', '1279755598817')])
     }
@@ -269,6 +243,31 @@ class Mocks {
         mergedInstanceGroupingService
     }
 
+    private static DnsService dnsService
+    static DnsService dnsService() {
+        if (dnsService == null) {
+            MockUtils.mockLogging(DnsService, false)
+            dnsService = new DnsService() {
+                Collection<String> getCanonicalHostNamesForDnsName(String hostName) { ['localhost'] }
+            }
+        }
+        dnsService
+    }
+
+    private static EurekaAddressCollectorService eurekaAddressCollectorService
+    static EurekaAddressCollectorService eurekaAddressCollectorService() {
+        if (eurekaAddressCollectorService == null) {
+            MockUtils.mockLogging(EurekaAddressCollectorService, false)
+            eurekaAddressCollectorService = new EurekaAddressCollectorService()
+            eurekaAddressCollectorService.caches = caches()
+            eurekaAddressCollectorService.configService = configService()
+            eurekaAddressCollectorService.restClientService = restClientService()
+            eurekaAddressCollectorService.dnsService = dnsService()
+            eurekaAddressCollectorService.initializeCaches()
+        }
+        eurekaAddressCollectorService
+    }
+
     private static DiscoveryService discoveryService
     static DiscoveryService discoveryService() {
         if (discoveryService == null) {
@@ -276,9 +275,12 @@ class Mocks {
             discoveryService = new DiscoveryService()
             discoveryService.grailsApplication = grailsApplication()
             discoveryService.caches = caches()
+            discoveryService.eurekaAddressCollectorService = eurekaAddressCollectorService()
             discoveryService.configService = configService()
             discoveryService.taskService = taskService()
-            discoveryService.metaClass.getAppInstancesByIds = { UserContext userContext, List<String> instanceIds -> [] }
+            discoveryService.metaClass.getAppInstancesByIds = { UserContext userContext, List<String> instanceIds ->
+                []
+            }
             discoveryService.initializeCaches()
         }
         discoveryService
@@ -331,9 +333,8 @@ class Mocks {
         if (awsClientService == null) {
             MockUtils.mockLogging(AwsClientService, false)
             awsClientService = new AwsClientService()
-            awsClientService.grailsApplication = grailsApplication()
-            awsClientService.secretService = new SecretService()
             awsClientService.configService = configService()
+            awsClientService.serverService = serverService()
             awsClientService.afterPropertiesSet()
         }
         awsClientService
@@ -367,7 +368,12 @@ class Mocks {
             }
             taskService.grailsApplication = grailsApplication()
             taskService.emailerService = emailerService()
-            taskService.awsSimpleDbService = awsSimpleDbService()
+            taskService.environmentService = new EnvironmentService()
+            taskService.idService = new IdService() {
+                String nextId(UserContext userContext, SimpleDbSequenceLocator sequenceLocator) {
+                    '1'
+                }
+            }
         }
         taskService
     }
@@ -377,7 +383,7 @@ class Mocks {
         if (emailerService == null) {
             MockUtils.mockLogging(EmailerService, false)
             emailerService = new EmailerService()
-            emailerService.grailsApplication = grailsApplication()
+            emailerService.configService = configService()
             emailerService.afterPropertiesSet()
         }
         emailerService
@@ -488,6 +494,7 @@ class Mocks {
             applicationService = applicationService()
             awsEc2Service = awsEc2Service()
             awsLoadBalancerService = awsLoadBalancerService()
+            configService = configService()
             discoveryService = discoveryService()
             mergedInstanceService = mergedInstanceService()
             taskService = taskService()
@@ -543,6 +550,7 @@ class Mocks {
         newAwsCloudWatchService.with {
             awsClientService = awsClientService()
             caches = caches()
+            configService = configService()
             taskService = taskService()
             afterPropertiesSet()
             initializeCaches()
@@ -583,6 +591,15 @@ class Mocks {
             configService.grailsApplication = grailsApplication()
         }
         configService
+    }
+
+    private static ServerService serverService
+    static ServerService serverService() {
+        if (serverService == null) {
+            serverService = new ServerService()
+            serverService.grailsApplication = grailsApplication()
+        }
+        serverService
     }
 
     private static AwsSqsService awsSqsService
@@ -649,7 +666,7 @@ class Mocks {
 
     static void waitForFill(Fillable cache) {
         while (!cache.filled) {
-            sleep 10
+            Time.sleepCancellably(10)
         }
     }
 

@@ -20,8 +20,11 @@ import com.netflix.asgard.push.CommonPushOptions
 import com.netflix.asgard.push.RollingPushOperation
 import com.netflix.asgard.push.RollingPushOptions
 import grails.test.GrailsUnitTestCase
+import grails.test.mixin.TestMixin
+import grails.test.mixin.support.GrailsUnitTestMixin
 import org.joda.time.DateTime
 
+@TestMixin(GrailsUnitTestMixin)
 class PushOperationTests extends GrailsUnitTestCase {
 
     Date dateAlmond = new DateTime(1280199222000).toDate()
@@ -97,9 +100,9 @@ class PushOperationTests extends GrailsUnitTestCase {
         // Mock the AwsEc2Service with necessary methods.
         // Ranges dictate how many times the method is expected to be called.
         def awsEc2Control = mockFor(AwsEc2Service)
-        awsEc2Control.demand.getInstances(0..0) { UserContext userContext -> mockEc2Instances}
-        awsEc2Control.demand.getInstance(4..4) { UserContext userContext, instanceId->
-            mockEc2Instances.find{it.instanceId == instanceId}
+        awsEc2Control.demand.getInstances(0..0) { UserContext userContext -> mockEc2Instances }
+        awsEc2Control.demand.getInstance(4..4) { UserContext userContext, instanceId ->
+            mockEc2Instances.find { it.instanceId == instanceId }
         }
         RollingPushOperation pushOperation = new RollingPushOperation(options)
         pushOperation.awsEc2Service = awsEc2Control.createMock()

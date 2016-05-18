@@ -16,10 +16,15 @@
 package com.netflix.asgard
 
 import com.amazonaws.AmazonServiceException
+import com.amazonaws.services.simpleworkflow.flow.WorkflowClientExternal
+import com.amazonaws.services.simpleworkflow.model.ChildPolicy
 import com.google.common.collect.Lists
 import com.netflix.asgard.model.SimpleDbSequenceLocator
+import com.netflix.asgard.model.WorkflowExecutionBeanOptions
 import com.netflix.asgard.plugin.TaskFinishedListener
+import java.rmi.RemoteException
 import java.util.concurrent.ConcurrentLinkedQueue
+import org.apache.http.HttpStatus
 import org.codehaus.groovy.runtime.StackTraceUtils
 
 /**
@@ -30,30 +35,34 @@ import org.codehaus.groovy.runtime.StackTraceUtils
 class TaskService {
 
     static transactional = false
-    private static final Collection<String> NON_ALERTABLE_ERROR_CODES = ['ValidationError', 'InvalidParameterValue',
-            'InvalidGroup.InUse', 'DBInstanceAlreadyExists', 'DuplicateLoadBalancerName', 'InvalidDBInstanceState',
-            'InvalidDBSnapshotState']
+    private static final Collection<String> NON_ALERTABLE_ERROR_CODES = ['DBInstanceAlreadyExists',
+            'DuplicateLoadBalancerName', 'InvalidChangeBatch', 'InvalidDBInstanceState', 'InvalidDBSnapshotState',
+            'InvalidGroup.Duplicate', 'InvalidGroup.InUse', 'InvalidInput',  'InvalidParameterValue', 'ValidationError']
 
-    def awsSimpleDbService
+    Caches caches
+    def awsSimpleWorkflowService
+    def configService
     def emailerService
+    def environmentService
+    def flowService
+    def idService
     def grailsApplication
+    def objectMapper
     def pluginService
+    def restClientService
+    def serverService
 
     Integer numberOfCompletedTasksToRetain = 500
 
-    /** The location of the sequence number in SimpleDB */
-    final SimpleDbSequenceLocator sequenceLocator = new SimpleDbSequenceLocator(region: Region.defaultRegion(),
-            domainName: 'CLOUD_TASK_SEQUENCE', itemName: 'task_id', attributeName: 'value')
-
-    private ConcurrentLinkedQueue<Task> running = new ConcurrentLinkedQueue<Task>()
-    private ConcurrentLinkedQueue<Task> completed = new ConcurrentLinkedQueue<Task>()
+    private Queue<Task> running = new ConcurrentLinkedQueue<Task>()
+    private Queue<Task> completed = new ConcurrentLinkedQueue<Task>()
 
     Task startTask(UserContext userContext, String name, Closure work, Link link = null) {
         Task task = newTask(userContext, name, link)
-        //println "Starting task '${name}'(${work.getParameterTypes()}) from ${Thread.currentThread().name} ..."
+        log.debug "Starting task '${name}'(${work.getParameterTypes()}) from ${Thread.currentThread().name} ..."
         Thread.start("Task:${task.name}") {
-            //println "Running task '${task.name}' in thread ${task.thread.name} ..."
             started(task)
+            log.debug "Running task '${task.name}' in thread ${task.thread.name} ..."
             doWork(work, task)
             if (task.status != 'failed') {
                 completed(task)
@@ -84,19 +93,13 @@ class TaskService {
         } catch (CancelledException ignored) {
             // Thrown if task is cancelled while sleeping. Not an error.
         } catch (Exception e) {
-            if (task.status != 'failed') { // Tasks can be nested. We only want to capture the failure once.
+            if (task.status != 'failed' && task.name) {
+                // Tasks can be nested. We only want to capture the failure once.
+                // Unnamed tasks should not be marked completed. They are useful when you need to reuse code based on
+                // tasks without actually using the task system (like in an AWS SWF workflow with its own task system).
                 exception(task, e)
             }
             throw e
-        }
-    }
-
-    private String nextTaskId(UserContext userContext) {
-        try {
-            return awsSimpleDbService.incrementAndGetSequenceNumber(userContext, sequenceLocator)
-        } catch (Exception e) {
-            emailerService.sendExceptionEmail(e.toString(), e)
-            return UUID.randomUUID().toString()
         }
     }
 
@@ -106,9 +109,10 @@ class TaskService {
             String msg = grailsApplication.config.cloud.trackingTicketRequiredMessage ?: 'Tracking ticket required'
             throw new ValidationException(msg)
         }
-
-        Task task = new Task(id: nextTaskId(userContext), userContext: userContext, name: name, status: 'starting',
-                startTime: new Date(), env: grailsApplication.config.cloud.accountName, objectType: link?.type,
+        String id = idService.nextId(userContext, SimpleDbSequenceLocator.Task)
+        Date date = environmentService.currentDate
+        Task task = new Task(id: id, userContext: userContext, name: name, status: 'starting',
+                startTime: date, env: grailsApplication.config.cloud.accountName, objectType: link?.type,
                 objectId: link?.id
         )
         return task
@@ -168,49 +172,186 @@ class TaskService {
         if (completed.size() > numberOfCompletedTasksToRetain) {
             completed.poll()
         }
-        if (task.email) {
-            emailerService.sendUserEmail(task.email, task.summary, task.logAsString)
-        }
-        for(TaskFinishedListener taskFinishedListener in pluginService?.taskFinishedListeners) {
+        for (TaskFinishedListener taskFinishedListener in pluginService?.taskFinishedListeners) {
             try {
                 taskFinishedListener.taskFinished(task)
             } catch (Exception e) {
+                String className = taskFinishedListener.getClass().simpleName
+                log.error "Task finished listener ${className} failed for task ${task.id} ${task.summary}", e
                 emailerService.sendExceptionEmail("Task finished plugin error: $e", e)
             }
         }
     }
 
-    def getRunning = { Lists.newArrayList(running) }
+    /**
+     * @return only in-memory running tasks on the local system (no SWF workflow executions)
+     */
+    List<Task> getLocalRunningInMemory() {
+        Lists.newArrayList(running)
+    }
 
-    def getCompleted = { Lists.newArrayList(completed) }
+    /**
+     * @return all the running in-memory tasks from all the other remote Asgard machines
+     */
+    List<Task> getRemoteRunningInMemory() {
+        serverService.listRemoteServerNamesAndPorts().collect {
+            String url = "http://${it}/task/runningInMemory.json"
+            String json = restClientService.getJsonAsText(url)
+            log.debug "Remote tasks from ${url}: ${json}"
+            if (json) {
+                return objectMapper.reader(Task).readValues(json) as List<Task>
+            }
+            []
+        }.flatten() as List<Task>
+    }
 
-    Task getTaskById(String id) {
-        Task task = running.find { it.id == id }
-        if (!task) { task = completed.find { it.id == id } }
+    /**
+     * @return a single concatenated list of all locally cached running tasks (without tasks on other Asgard servers)
+     */
+    List<Task> getAllRunningInCache() {
+        localRunningInMemory
+    }
 
-        // If we hit a race condition where a task id is used before the task is running then wait and try again.
-        if (!task) {
-            sleep 1000
-            task = running.find { it.id == id }
+    /**
+     * @return a list of all running tasks from the AWS Simple Workflow Service
+     */
+    List<Task> getAllRunningInSwf() {
+        awsSimpleWorkflowService.openWorkflowExecutions.collect {
+            new WorkflowExecutionBeanOptions(it).asTask()
         }
+    }
 
-        task
+    /**
+     * @return a single concatenated list of all in-memory running tasks from the local and all the remote servers
+     */
+    List<Task> getAllRunningInMemory() {
+        localRunningInMemory + remoteRunningInMemory
+    }
+
+    /**
+     * @return all running tasks including local and remote in-memory tasks, and cached SWF workflow executions
+     */
+    Collection<Task> getAllRunning() {
+        allRunningInMemory + allRunningInSwf
+    }
+
+    /**
+     * @return all completed tasks (including SWF workflow executions within a recent time period)
+     */
+    Collection<Task> getAllCompleted() {
+        completed + awsSimpleWorkflowService.closedWorkflowExecutions.collect {
+            new WorkflowExecutionBeanOptions(it).asTask()
+        }
+    }
+
+    /**
+     * Looks up a task by its ID.
+     *
+     * @param id for task
+     * @return task or null if no task was found
+     */
+    Task getTaskById(String id) {
+        if (!id) { return null }
+        try {
+            new Retriable<Task>(
+                    work: {
+                        Task task = getLocalTaskById(id) ?: getWorkflowTaskById(id) ?: getRemoteTaskById(id)
+                        if (!task) { throw new IllegalArgumentException("There is no task with id ${id}.") }
+                        task
+                    },
+                    firstDelayMillis: 300
+            ).performWithRetries()
+        } catch (CollectedExceptions ignore) {
+            return null
+        }
+    }
+
+    /**
+     * Looks up a task from the workflow executions in Amazon Simple Workflow.
+     *
+     * @param id the unique ID of the task to find
+     * @return a matching Task for an SWF workflow execution, or null if none found
+     */
+    Task getWorkflowTaskById(String id) {
+        if (!id) { return null }
+        awsSimpleWorkflowService.getWorkflowExecutionInfoByTaskId(id)?.asTask()
+    }
+
+    /**
+     * Looks up a local in-memory task by its ID, either in the collection of running tasks or completed tasks.
+     *
+     * @param id the unique ID of the task to find
+     * @return a matching Task that is running in-memory in the local JVM machine, or null if none found
+     */
+    Task getLocalTaskById(String id) {
+        if (!id) { return null }
+        running.find { it.id == id } ?: completed.find { it.id == id }
+    }
+
+    /**
+     * Looks for a matching Task on all remote systems and returns the first one found, or null if none found.
+     *
+     * @param id the unique ID of the task to find
+     * @return a matching Task that is running in-memory on a remote machine, or null if none found
+     */
+    Task getRemoteTaskById(String id) {
+        if (!id) { return null }
+        serverService.listRemoteServerNamesAndPorts().findResult {
+            String url = "http://${it}/task/runningInMemory/${id}.json"
+            String json = restClientService.getJsonAsText(url)
+            log.debug "Remote task from ${url}: ${json}"
+            if (json) {
+                Task task = objectMapper.reader(com.netflix.asgard.Task).readValue(json) as Task
+                task.server = it
+                return task
+            }
+            null
+        } as Task
     }
 
     Collection<Task> getRunningTasksByObject(Link link, Region region) {
         Closure matcher = { it.objectType == link.type && it.objectId == link.id && it.userContext.region == region }
-        running.findAll(matcher).sort { it.startTime }
+        // This is incomplete because it should include tasks running on other Asgard instances.
+        // The cluster screen uses this, so changing it to call remote Asgard instances would impact performance of the
+        // cluster screen. To solve the performance problem of the remote Asgard instances, either cache the running
+        // tasks of remote Asgards, or refactor all long-running tasks into SWF workflows so the need to call remote
+        // Asgards for in-memory task lists goes away.
+        allRunningInCache.findAll(matcher).sort { it.startTime }
     }
 
+    /**
+     * Interrupts and stops a running task, be it local in-memory, remote in-memory, or a workflow execution in
+     * Amazon Simple Workflow Service
+     *
+     * @param userContext who, where, why
+     * @param task the task to cancel
+     */
     void cancelTask(UserContext userContext, Task task) {
-        try {
-            task.thread.interrupt()
-            task.log("Cancelled by ${userContext.clientHostName}")
-            fail(task)
-        } catch (CancelledException ignored) {
-            // Thrown if task is cancelled while sleeping. Not an error.
-        } catch (Exception e) {
-            exception(task, e)
+        String cancelledByMessage = "Cancelled by ${userContext.username ?: 'user'}@${userContext.clientHostName}"
+        if (task.workflowExecution) {
+            WorkflowClientExternal client = flowService.getWorkflowClient(task.workflowExecution)
+            client.terminateWorkflowExecution(cancelledByMessage, task.toString(), ChildPolicy.TERMINATE)
+        } else if (task.server) {
+            String url = "http://${task.server}/task/cancel"
+            int statusCode = restClientService.post(url, [id: task.id, format: 'json'])
+            if (statusCode != HttpStatus.SC_OK) {
+                String msg = "Error trying to cancel remote task ${task.id} '${task.name}' on '${task.server}' " +
+                        "Response status code was ${statusCode}"
+                throw new RemoteException(msg)
+            }
+        } else if (task.thread) {
+            try {
+                task.thread.interrupt()
+                task.log(cancelledByMessage, environmentService.currentDate)
+                fail(task)
+            } catch (CancelledException ignored) {
+                // Thrown if task is cancelled while sleeping. Not an error.
+            } catch (Exception e) {
+                exception(task, e)
+            }
+        } else {
+            String msg = "ERROR: Unable to cancel task lacking workflowExecution, thread, or server of origin: ${task}"
+            throw new IllegalStateException(msg)
         }
     }
 }

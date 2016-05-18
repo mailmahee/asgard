@@ -15,21 +15,43 @@
  */
 package com.netflix.asgard
 
-import org.joda.time.DateTime
-
+/**
+ * Logic for determining whether the system is currently in a state good enough to accept user traffic.
+ */
 class HealthcheckService implements BackgroundProcessInitializer {
 
     static transactional = false
 
-    private static final Integer RECENT_MINUTES = 10
+    def serverService
 
-    Caches caches
-    def configService
-    def initService
+    /**
+     * Cached result of periodic health check calculation.
+     */
+    Boolean readyForTraffic = false
 
-    Boolean isHealthy = false
-    Map<String, String> cacheNamesToProblems = new TreeMap<String, String>()
+    /**
+     * Registered procedures that should be called each time the health check runs. Each closure is expected to have
+     * this signature:
+     * <p>
+     * callback(Boolean wasHealthyLastTime, Boolean isHealthyNow)
+     */
+    Map<String, Closure> callbackNamesToCallbacks = [:]
 
+    /**
+     * Adds a new named callback to the map of callbacks to call each time the health check runs.
+     *
+     * @param name the name of the registered callback
+     * @param callback the Closure to execute, which should take two Boolean parameters like
+     *          callback(Boolean wasHealthyLastTime, Boolean isHealthyNow)
+     */
+    void registerCallback(String name, Closure callback) {
+        callbackNamesToCallbacks.put(name, callback)
+    }
+
+    /**
+     * Starts the background thread that periodically checks the health of the server, updates the readyForTraffic flag,
+     * and calls any registered callbacks that need to be executed when health changes.
+     */
     void initializeBackgroundProcess() {
         start()
     }
@@ -38,70 +60,25 @@ class HealthcheckService implements BackgroundProcessInitializer {
         Thread.startDaemon('Healthcheck') {
             //noinspection GroovyInfiniteLoopStatement
             while (true) {
-                checkCaches()
+                checkHealthAndInvokeCallbacks()
                 sleep 5000
             }
         }.priority = Thread.MIN_PRIORITY
     }
 
-    private checkCaches() {
-        try {
-            if (initService.cachesFilled()) {
-                cacheNamesToProblems.remove('All')
-            } else {
-                cacheNamesToProblems['All'] = 'Server is starting up'
-                isHealthy = false
-                return
-            }
-            DateTime recentTime = new DateTime().minusMinutes(RECENT_MINUTES)
-            Map<String, Integer> minimumCounts = configService.healthCheckMinimumCounts
-            boolean cachesHealthy = true
-            minimumCounts.each { cacheName, threshold ->
-                MultiRegionCachedMap multiRegionCachedMap
-                try {
-                    multiRegionCachedMap = caches[cacheName] as MultiRegionCachedMap
-                } catch (MissingPropertyException ignored) {
-                    log.error("Invalid cache name ${cacheName} specified for healthCheck in config")
-                    cachesHealthy = false
-                    cacheNamesToProblems[cacheName] = 'Invalid cache name'
-                    return
-                }
-                try {
-                    if (findProblem(multiRegionCachedMap, recentTime, threshold)) {
-                        cachesHealthy = false
-                    }
-                } catch (Exception e){
-                    log.error "Error checking health for ${cacheName}", e
-                    cachesHealthy = false
-                    cacheNamesToProblems[cacheName] = e.message
-                }
-            }
-            isHealthy = cachesHealthy
-        } catch (Exception e) {
-            log.error 'Healthcheck threw an exception', e
-            isHealthy = false
+    /**
+     * Performs the health check to determine whether or not the system is currently ready for traffic, then calls any
+     * registered callbacks that need to respond to health check events.
+     *
+     * @return true if the system is ready for traffic, false otherwise
+     * @see ServerService#shouldCacheLoadingBlockUserRequests()
+     */
+    void checkHealthAndInvokeCallbacks() {
+        Boolean wasHealthyLastTime = readyForTraffic
+        Boolean isHealthyNow = !serverService.shouldCacheLoadingBlockUserRequests()
+        readyForTraffic = isHealthyNow
+        for (Closure callback in callbackNamesToCallbacks.values()) {
+            callback(wasHealthyLastTime, isHealthyNow)
         }
-    }
-
-    private String findProblem(MultiRegionCachedMap multiRegionCachedMap, DateTime recentTime, Integer minSize) {
-        CachedMap defaultRegionCachedMap = multiRegionCachedMap.by(Region.defaultRegion())
-        // Secondary object caches like Cluster don't have intervals, so assume a common number.
-        DateTime beforeLastScheduledFill = new DateTime().minusSeconds(defaultRegionCachedMap.interval ?: 120)
-        String problem = ''
-
-        if (defaultRegionCachedMap.active && defaultRegionCachedMap.lastActiveTime.isBefore(beforeLastScheduledFill) &&
-                defaultRegionCachedMap.lastFillTime.isBefore(recentTime)) {
-            problem = "Cache is actively used but last fill time is ${defaultRegionCachedMap.lastFillTime} which is " +
-                    "before ${RECENT_MINUTES} minutes ago at ${recentTime}"
-        } else if (defaultRegionCachedMap.size() < minSize) {
-            problem = "Cache size is ${defaultRegionCachedMap.size()} which is below minimum size ${minSize}"
-        }
-
-        if (problem) {
-            cacheNamesToProblems.put(defaultRegionCachedMap.name, problem)
-        } else {
-            cacheNamesToProblems.remove(defaultRegionCachedMap.name)
-        }
-        problem
     }
 }

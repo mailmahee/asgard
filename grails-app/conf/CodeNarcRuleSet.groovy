@@ -20,18 +20,35 @@ ruleset {
 //    rule('file:test/unit/com/netflix/asgard/codenarc/ExplicitCallToSpringAutoWire.groovy') {
 //        description = 'Use of Spring.autowire(...) can become unstable.'
 //    }
+    rule('file:test/unit/com/netflix/asgard/codenarc/MissingBlankLineAfterPackageRule.groovy') {
+        description = 'A blank line should occur after the package declaration.'
+    }
+    rule('file:test/unit/com/netflix/asgard/codenarc/MissingBlankLineAfterImportsRule.groovy') {
+        description = 'A blank line should occur after the imports.'
+    }
+    rule('file:test/unit/com/netflix/asgard/codenarc/BlankLineBeforePackageRule.groovy') {
+        description = 'No blank lines should occur before the package declaration.'
+    }
+    rule('file:test/unit/com/netflix/asgard/codenarc/ConsecutiveBlankLinesRule.groovy') {
+        description = 'Consecutive blank lines are not permitted.'
+    }
+    rule('file:test/unit/com/netflix/asgard/codenarc/FileEndsWithoutNewlineRule.groovy') {
+        description = 'Each source code file should end with a newline character.'
+    }
 
     // rulesets/basic.xml
     AssertWithinFinallyBlock
     AssignmentInConditional
     BigDecimalInstantiation
     BitwiseOperatorInConditional
-    BooleanGetBoolean
+    BooleanGetBoolean {
+        priority = 1
+    }
     BrokenNullCheck
     BrokenOddnessCheck
     ClassForName
     ComparisonOfTwoConstants
-//    ComparisonWithSelf
+    ComparisonWithSelf
     ConstantAssertExpression
     ConstantIfExpression
     ConstantTernaryExpression
@@ -40,7 +57,7 @@ ruleset {
     DuplicateCaseStatement
     DuplicateMapKey
     DuplicateSetValue
-//    EmptyCatchBlock
+    EmptyCatchBlock
     EmptyElseBlock
     EmptyFinallyBlock
     EmptyForStatement
@@ -67,7 +84,7 @@ ruleset {
     // rulesets/braces.xml
     ElseBlockBraces
     ForStatementBraces
-//    IfStatementBraces
+    IfStatementBraces
     WhileStatementBraces
 
     // rulesets/concurrency.xml
@@ -89,6 +106,7 @@ ruleset {
     SynchronizedOnThis
     SynchronizedReadObjectMethod
     SystemRunFinalizersOnExit
+//    ThisReferenceEscapesConstructor
     ThreadGroup
     ThreadLocalNotStaticFinal
     ThreadYield
@@ -101,9 +119,10 @@ ruleset {
     ConfusingTernary
 //    CouldBeElvis
     HashtableIsObsolete
+    IfStatementCouldBeTernary
 //    InvertedIfElse
     LongLiteralWithLowerCaseL
-//    ParameterReassignment
+    ParameterReassignment
     TernaryCouldBeElvis
     VectorIsObsolete
 
@@ -143,6 +162,7 @@ ruleset {
     CatchThrowable
     ConfusingClassNamedException
     ExceptionExtendsError
+    ExceptionNotThrown
     MissingNewInThrowStatement
 //    ReturnNullFromCatchBlock
     SwallowThreadDeath
@@ -158,26 +178,68 @@ ruleset {
     BracesForIfElse
     BracesForMethod
     BracesForTryCatchFinally
-    ClassJavadoc
-//    LineLength
+//    ClassJavadoc
+    LineLength
+    SpaceAfterCatch
+//    SpaceAfterClosingBrace // Good but needs option to accept [{ ok() }] and items.collect { it.key }[0]
+    SpaceAfterComma
+    SpaceAfterFor
+    SpaceAfterIf
+    SpaceAfterOpeningBrace
+    SpaceAfterSemicolon
+    SpaceAfterSwitch
+    SpaceAfterWhile
+    SpaceAroundClosureArrow
+    SpaceAroundOperator
+    SpaceBeforeClosingBrace
+//    SpaceBeforeOpeningBrace // Good but needs new option to accept call({ go() }, 4) and [{ okie() }, { dokie() }]
 
     // rulesets/generic.xml
+    IllegalClassMember
     IllegalClassReference
     IllegalPackageReference
     IllegalRegex
+    IllegalRegex {
+        name = 'TrailingWhitespace'
+        regex = /[^\n]*[ \t]+\n/
+        description = 'Lines must not end with whitespace characters.'
+    }
     RequiredRegex
+    RequiredRegex {
+        name = 'MissingCopyrightHeader'
+        regex = '''\
+                [/][*]
+                 [*] Copyright 20\\d\\d Netflix, Inc[.]
+                 [*]
+                 [*] Licensed under the Apache License, Version 2[.]0 [(]the "License"[)];
+                 [*] you may not use this file except in compliance with the License[.]
+                 [*] You may obtain a copy of the License at
+                 [*]
+                 [*]     http:[/][/]www[.]apache[.]org[/]licenses[/]LICENSE-2[.]0
+                 [*]
+                 [*] Unless required by applicable law or agreed to in writing, software
+                 [*] distributed under the License is distributed on an "AS IS" BASIS,
+                 [*] WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied[.]
+                 [*] See the License for the specific language governing permissions and
+                 [*] limitations under the License[.]
+                 [*][/]
+                '''.stripIndent()
+        description = 'Source files must start with standard copyright header.'
+    }
     RequiredString
     StatelessClass
 
     // rulesets/grails.xml
 //    GrailsDomainHasEquals
 //    GrailsDomainHasToString
-    GrailsPublicControllerMethod {
-        priority = 1
-    }
-    GrailsServletContextReference
+    GrailsDuplicateMapping
+//    GrailsPublicControllerMethod
+//    GrailsServletContextReference
     GrailsSessionReference
 //    GrailsStatelessService
+    GrailsDuplicateConstraint
+    GrailsDomainWithServiceReference
+    GrailsDomainReservedSqlKeywordName
 
     // rulesets/groovyism.xml
 //    AssignCollectionSort
@@ -185,30 +247,31 @@ ruleset {
 //    ClosureAsLastMethodParameter
     CollectAllIsDeprecated
     ConfusingMultipleReturns
-//    ExplicitArrayListInstantiation
+    ExplicitArrayListInstantiation
     ExplicitCallToAndMethod
-//    ExplicitCallToCompareToMethod
+    ExplicitCallToCompareToMethod
     ExplicitCallToDivMethod
-//    ExplicitCallToEqualsMethod
+    ExplicitCallToEqualsMethod
     ExplicitCallToGetAtMethod
     ExplicitCallToLeftShiftMethod
-//    ExplicitCallToMinusMethod
+    ExplicitCallToMinusMethod
     ExplicitCallToModMethod
     ExplicitCallToMultiplyMethod
     ExplicitCallToOrMethod
-//    ExplicitCallToPlusMethod
+    ExplicitCallToPlusMethod
     ExplicitCallToPowerMethod
     ExplicitCallToRightShiftMethod
     ExplicitCallToXorMethod
-//    ExplicitHashMapInstantiation
-//    ExplicitHashSetInstantiation
-//    ExplicitLinkedHashMapInstantiation
-//    ExplicitLinkedListInstantiation
-//    ExplicitStackInstantiation
+    ExplicitHashMapInstantiation
+    ExplicitHashSetInstantiation
+    ExplicitLinkedHashMapInstantiation
+    ExplicitLinkedListInstantiation
+    ExplicitStackInstantiation
 //    ExplicitTreeSetInstantiation
     GStringAsMapKey
 //    GetterMethodCouldBeProperty
-//    GroovyLangImmutable  TODO: Enable for Groovy 1.8
+    GroovyLangImmutable
+//    GStringExpressionWithinString
 //    UseCollectMany
     UseCollectNested
 
@@ -232,12 +295,15 @@ ruleset {
     JUnitAssertAlwaysFails
     JUnitAssertAlwaysSucceeds
     JUnitFailWithoutMessage
+//    JUnitLostTest
+    JUnitPublicField
     JUnitPublicNonTestMethod
 //    JUnitSetUpCallsSuper
 //    JUnitStyleAssertions
 //    JUnitTearDownCallsSuper
     JUnitTestMethodWithoutAssert
     JUnitUnnecessarySetUp
+    JUnitUnnecessaryThrowsException
     JUnitUnnecessaryTearDown
     SpockIgnoreRestUsed
     UnnecessaryFail
@@ -253,7 +319,7 @@ ruleset {
     LoggerWithWrongModifiers
     LoggingSwallowsStacktrace
     MultipleLoggers
-    PrintStackTrace{
+    PrintStackTrace {
         priority = 1
     }
     Println {
@@ -269,6 +335,7 @@ ruleset {
     // rulesets/naming.xml
     AbstractClassName
     ClassName
+    ClassNameSameAsFilename
 //    ConfusingMethodName
 //    FactoryMethodName
 //    FieldName // we are a bit lax about conventions here
@@ -292,12 +359,14 @@ ruleset {
     UnsafeArrayDeclaration
 
     // rulesets/serialization.xml
+    EnumCustomSerializationIgnored
     SerialPersistentFields
     SerialVersionUID
 //    SerializableClassMustDefineSerialVersionUID
 
     // rulesets/size.xml
 //    AbcComplexity
+//    AbcMetric
 //    ClassSize
 //    CrapMetric
     CyclomaticComplexity
@@ -306,7 +375,7 @@ ruleset {
 //    NestedBlockDepth
 
     // rulesets/unnecessary.xml
-//    AddEmptyString
+    AddEmptyString
     ConsecutiveLiteralAppends
     ConsecutiveStringConcatenation
     UnnecessaryBigDecimalInstantiation
@@ -319,10 +388,10 @@ ruleset {
 //    UnnecessaryCollectCall
     UnnecessaryCollectionCall
     UnnecessaryConstructor
-//    UnnecessaryDefInFieldDeclaration
-//    UnnecessaryDefInMethodDeclaration
-//    UnnecessaryDefInVariableDeclaration
-//    UnnecessaryDotClass
+    UnnecessaryDefInFieldDeclaration
+    UnnecessaryDefInMethodDeclaration
+    UnnecessaryDefInVariableDeclaration
+    UnnecessaryDotClass
     UnnecessaryDoubleInstantiation
 //    UnnecessaryElseStatement
     UnnecessaryFinalOnPrivateMethod
@@ -354,9 +423,9 @@ ruleset {
     UnusedArray
 //    UnusedMethodParameter
     UnusedObject
-//    UnusedPrivateField // showed false positives
+    UnusedPrivateField
     UnusedPrivateMethod
-//    UnusedPrivateMethodParameter
+    UnusedPrivateMethodParameter
 //    UnusedVariable
 
 }

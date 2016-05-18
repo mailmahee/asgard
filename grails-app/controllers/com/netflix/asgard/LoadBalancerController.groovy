@@ -18,6 +18,7 @@ package com.netflix.asgard
 import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.ec2.model.AvailabilityZone
+import com.amazonaws.services.ec2.model.GroupIdentifier
 import com.amazonaws.services.ec2.model.SecurityGroup
 import com.amazonaws.services.elasticloadbalancing.model.HealthCheck
 import com.amazonaws.services.elasticloadbalancing.model.Listener
@@ -39,14 +40,17 @@ class LoadBalancerController {
     def configService
     def stackService
 
-    // The delete, save and update actions only accept POST requests
-    def static allowedMethods = [
+    static allowedMethods = [
             delete: 'POST', save: 'POST', update: 'POST', addListener: 'POST', removeListener: 'POST'
     ]
 
-    def index = { redirect(action: 'list', params: params) }
+    static editActions = ['prepareListener']
 
-    def list = {
+    def index() {
+        redirect(action: 'list', params: params)
+    }
+
+    def list() {
         UserContext userContext = UserContext.of(request)
         Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
         Collection<LoadBalancerDescription> loadBalancers = awsLoadBalancerService.getLoadBalancers(userContext)
@@ -63,7 +67,7 @@ class LoadBalancerController {
         }
     }
 
-    def show = {
+    def show() {
         String name = params.name ?: params.id
         UserContext userContext = UserContext.of(request)
         LoadBalancerDescription lb = awsLoadBalancerService.getLoadBalancer(userContext, name)
@@ -78,6 +82,8 @@ class LoadBalancerController {
             List<InstanceStateData> instanceStateDatas = awsLoadBalancerService.getInstanceStateDatas(
                     userContext, name, groups)
             String subnetPurpose = awsEc2Service.getSubnets(userContext).coerceLoneOrNoneFromIds(lb.subnets)?.purpose
+            List<GroupIdentifier> securityGroups = awsEc2Service.getSecurityGroupNameIdPairsByNamesOrIds(userContext,
+                    lb.securityGroups)
             Map details = [
                     loadBalancer: lb,
                     app: applicationService.getRegisteredApplication(userContext, appName),
@@ -85,6 +91,7 @@ class LoadBalancerController {
                     groups: groups,
                     instanceStates: instanceStateDatas,
                     subnetPurpose: subnetPurpose ?: '',
+                    securityGroups: securityGroups,
             ]
             withFormat {
                 html { return details }
@@ -94,7 +101,7 @@ class LoadBalancerController {
         }
     }
 
-    def create = {
+    def create() {
         UserContext userContext = UserContext.of(request)
         List<SecurityGroup> effectiveGroups = awsEc2Service.getEffectiveSecurityGroups(userContext).sort {
             it.groupName?.toLowerCase()
@@ -105,7 +112,6 @@ class LoadBalancerController {
         Collection<String> selectedZones = awsEc2Service.preselectedZoneNames(availabilityZones,
                 Requests.ensureList(params.selectedZones))
         Subnets subnets = awsEc2Service.getSubnets(userContext)
-        Map<String, String> purposeToVpcId = subnets.mapPurposeToVpcId()
         [
             applications: applicationService.getRegisteredApplicationsForLoadBalancer(userContext),
             stacks: stackService.getStacks(userContext),
@@ -113,16 +119,17 @@ class LoadBalancerController {
             subnetPurposes: subnets.getPurposesForZones(availabilityZones*.zoneName, SubnetTarget.ELB).sort(),
             zonesGroupedByPurpose: subnets.groupZonesByPurpose(availabilityZones*.zoneName, SubnetTarget.ELB),
             selectedZones: selectedZones,
-            purposeToVpcId: purposeToVpcId,
-            vpcId: purposeToVpcId[params.subnetPurpose],
+            purposeToVpcId: subnets.mapPurposeToVpcId(),
+            vpcId: subnets.getVpcIdForSubnetPurpose(params.subnetPurpose),
             securityGroupsGroupedByVpcId: securityGroupsGroupedByVpcId,
             selectedSecurityGroups: Requests.ensureList(params.selectedSecurityGroups),
+            protocols: protocols,
         ]
     }
 
-    def save = { LoadBalancerCreateCommand cmd ->
+    def save(LoadBalancerCreateCommand cmd) {
         if (cmd.hasErrors()) {
-            chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass both the errors and the params
+            chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass both errors and params
         } else {
 
             // Load Balancer name
@@ -138,18 +145,19 @@ class LoadBalancerController {
                 Listener listener1 = new Listener().withProtocol(params.protocol1).
                         withLoadBalancerPort(params.lbPort1.toInteger()).
                         withInstancePort(params.instancePort1.toInteger())
-                List<Listener> listeners = [listener1]
+                List<Listener> listeners = [handleHttpsListener(listener1)]
                 if (params.protocol2) {
-                    listeners.add(new Listener()
+                    listeners.add(handleHttpsListener(new Listener()
                             .withProtocol(params.protocol2)
-                            .withLoadBalancerPort(params.lbPort2.toInteger()).withInstancePort(params.instancePort2.toInteger()))
+                            .withLoadBalancerPort(params.lbPort2.toInteger())
+                            .withInstancePort(params.instancePort2.toInteger())))
                 }
                 String subnetPurpose = params.subnetPurpose ?: null
                 awsLoadBalancerService.createLoadBalancer(userContext, lbName, zoneList, listeners, securityGroups,
                         subnetPurpose)
                 updateHealthCheck(userContext, lbName, params)
                 flash.message = "Load Balancer '${lbName}' has been created. " + configService.postElbCreationMessage
-                redirect(action: 'show', params:[name:lbName])
+                redirect(action: 'show', params: [name: lbName])
             } catch (Exception e) {
                 flash.message = "Could not create Load Balancer: ${e}"
                 chain(action: 'create', model: [cmd: cmd], params: params)
@@ -157,7 +165,7 @@ class LoadBalancerController {
         }
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
         String name = params.name
         try {
@@ -170,7 +178,7 @@ class LoadBalancerController {
         }
     }
 
-    def edit = {
+    def edit() {
         String name = params.name ?: params.id
         UserContext userContext = UserContext.of(request)
         [
@@ -209,13 +217,14 @@ class LoadBalancerController {
         }
     }
 
-    def update = {
+    def update() {
         String name = params.name
         UserContext userContext = UserContext.of(request)
         LoadBalancerDescription lb = awsLoadBalancerService.getLoadBalancer(userContext, name)
 
         List<String> zoneList = Requests.ensureList(params.selectedZones)
-        if (lb.subnets) {
+        List<String> defaultVpcSubnetIds = awsEc2Service.getDefaultVpcSubnetIds(userContext)
+        if (lb.subnets.any { !(it in defaultVpcSubnetIds) }) {
             updateLbSubnets(userContext, name, zoneList, lb.subnets)
         } else {
             updateLbZones(userContext, name, zoneList, lb.availabilityZones)
@@ -233,7 +242,7 @@ class LoadBalancerController {
         }
 
         if (healthCheckUpdated) {
-            String msg  = "Load Balancer '${name}' health check has been updated. "
+            String msg = "Load Balancer '${name}' health check has been updated. "
             flash.message = flash.message ? flash.message + msg : msg
         }
         redirect(action: 'show', params: [id: name])
@@ -246,22 +255,30 @@ class LoadBalancerController {
                 withUnhealthyThreshold(params.unhealthy.toInteger()).withHealthyThreshold(params.healthy.toInteger()))
     }
 
-    def prepareListener = {
+    def prepareListener() {
         String loadBalancer = params.id ?: params.name
         String protocol = params.protocol
         String lbPort = params.lbPort
         String instancePort = params.instancePort
-        [loadBalancer: loadBalancer, protocol: protocol, lbPort: lbPort, instancePort: instancePort]
+        [
+            loadBalancer: loadBalancer,
+            protocol: protocol,
+            lbPort: lbPort,
+            instancePort: instancePort,
+            protocols: protocols
+        ]
     }
 
-    def addListener = { AddListenerCommand cmd ->
+    def addListener(AddListenerCommand cmd) {
         if (cmd.hasErrors()) {
-            chain(action: 'prepareListener', model: [cmd:cmd], params: params)
+            chain(action: 'prepareListener', model: [cmd: cmd], params: params)
         } else {
             UserContext userContext = UserContext.of(request)
             Listener listener = new Listener(protocol: cmd.protocol, loadBalancerPort: cmd.lbPort,
                     instancePort: cmd.instancePort)
+
             try {
+                listener = handleHttpsListener(listener)
                 awsLoadBalancerService.addListeners(userContext, cmd.name, [listener])
                 flash.message = "Listener has been added to port ${listener.loadBalancerPort}."
                 redirect(action: 'show', params: [id: cmd.name])
@@ -272,7 +289,7 @@ class LoadBalancerController {
         }
     }
 
-    def removeListener = { RemoveListenerCommand cmd ->
+    def removeListener(RemoveListenerCommand cmd) {
         if (cmd.hasErrors()) {
             chain(action: 'show', model: [cmd: cmd], params: params)
         } else {
@@ -288,7 +305,28 @@ class LoadBalancerController {
         }
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
+
+    private getProtocols() {
+        if (configService.defaultElbSslCertificateId) {
+            ['HTTP', 'HTTPS', 'TCP']
+        } else {
+            ['HTTP', 'TCP']
+        }
+    }
+
+    private Listener handleHttpsListener(listener) {
+        if (listener.getProtocol().equalsIgnoreCase("https")) {
+            def cert = configService.defaultElbSslCertificateId
+            if (cert && !cert.allWhitespace) {
+                    return listener.withSSLCertificateId(cert)
+                }
+            throw new IllegalStateException("Missing cloud.defaultElbSslCertificateId value in Config.groovy")
+        }
+        return listener
+     }
 }
 
 class LoadBalancerCreateCommand {
@@ -316,7 +354,7 @@ class LoadBalancerCreateCommand {
 
     static constraints = {
 
-        appName(nullable: false, blank: false, validator: { value, command->
+        appName(nullable: false, blank: false, validator: { value, command ->
             UserContext userContext = UserContext.of(Requests.request)
             if (!Relationships.checkStrictName(value)) {
                 return "application.name.illegalChar"
@@ -327,12 +365,13 @@ class LoadBalancerCreateCommand {
             if (!command.applicationService.getRegisteredApplicationForLoadBalancer(userContext, value)) {
                 return "application.name.nonexistent"
             }
-            if ("${value}-${command.stack}${command.newStack}-${command.detail}".length() > Relationships.GROUP_NAME_MAX_LENGTH) {
+            if ("${value}-${command.stack}${command.newStack}-${command.detail}".length() >
+                    Relationships.GROUP_NAME_MAX_LENGTH) {
                 return "The complete load balancer name cannot exceed ${Relationships.GROUP_NAME_MAX_LENGTH} characters"
             }
         })
 
-        stack(nullable: true, validator: { value, command->
+        stack(nullable: true, validator: { value, command ->
             if (value && !Relationships.checkName(value)) {
                 return "The stack must be empty or consist of alphanumeric characters"
             }
@@ -341,7 +380,7 @@ class LoadBalancerCreateCommand {
             }
         })
 
-        newStack(nullable: true, validator: { value, command->
+        newStack(nullable: true, validator: { value, command ->
             if (value && !Relationships.checkName(value)) {
                 return "stack.illegalChar"
             }
@@ -353,7 +392,7 @@ class LoadBalancerCreateCommand {
             }
         })
 
-        detail(nullable: true, validator: { value, command->
+        detail(nullable: true, validator: { value, command ->
             if (value && !Relationships.checkDetail(value)) {
                 return "The detail must be empty or consist of alphanumeric characters and hyphens"
             }
@@ -366,7 +405,7 @@ class LoadBalancerCreateCommand {
         lbPort1(nullable: false, range: 0..65535)
         instancePort1(nullable: false, range: 0..65535)
 
-        protocol2(nullable: true, validator: { value, command->
+        protocol2(nullable: true, validator: { value, command ->
             if (value && (!command.lbPort2 || !command.instancePort2) ) {
                 return "Please enter port numbers for the second protocol"
             }

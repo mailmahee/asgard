@@ -15,9 +15,15 @@
  */
 package com.netflix.asgard
 
+import com.amazonaws.services.autoscaling.model.LaunchConfiguration
+import com.amazonaws.services.ec2.model.GroupIdentifier
+import com.amazonaws.services.ec2.model.Instance
 import com.amazonaws.services.ec2.model.IpPermission
 import com.amazonaws.services.ec2.model.SecurityGroup
+import com.amazonaws.services.ec2.model.UserIdGroupPair
+import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
 import com.amazonaws.services.elasticloadbalancing.model.SourceSecurityGroup
+import com.netflix.asgard.model.Subnets
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
@@ -26,15 +32,18 @@ import grails.converters.XML
 class SecurityController {
 
     def applicationService
+    def awsAutoScalingService
     def awsEc2Service
     def awsLoadBalancerService
     def configService
 
-    def static allowedMethods = [save: 'POST', update: 'POST', delete: 'POST']
+    static allowedMethods = [save: 'POST', update: 'POST', delete: 'POST']
 
-    def index = { redirect(action: 'list', params: params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
         Collection<SecurityGroup> securityGroups = awsEc2Service.getSecurityGroups(userContext)
@@ -54,7 +63,7 @@ class SecurityController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         def name = params.name ?: params.id
         SecurityGroup group = awsEc2Service.getSecurityGroup(userContext, name)
@@ -62,15 +71,33 @@ class SecurityController {
             Requests.renderNotFound('Security Group', name, this)
             return
         }
+        for (IpPermission ipPermission in group.ipPermissions) {
+            List<UserIdGroupPair> pairs = ipPermission.userIdGroupPairs
+            List<String> ids = pairs*.groupId
+            List<GroupIdentifier> groups = awsEc2Service.getSecurityGroupNameIdPairsByNamesOrIds(userContext, ids)
+            for (UserIdGroupPair pair in pairs) {
+                if (!pair.groupName) {
+                    pair.groupName = groups.find { it.groupId == pair.groupId }?.groupName
+                }
+            }
+            pairs.sort { a, b -> a.groupName?.compareToIgnoreCase b.groupName }
+        }
         group.ipPermissions.sort { it.userIdGroupPairs ? it.userIdGroupPairs[0].groupName : it.fromPort }
-        group.ipPermissions.each { it.userIdGroupPairs.sort { it.groupName } }
+
+        List<LaunchConfiguration> launchConfigs = awsAutoScalingService.getLaunchConfigurationsForSecurityGroup(
+                userContext, group)
+        Collection<Instance> instances = awsEc2Service.getInstancesWithSecurityGroup(userContext, group)
+        List<LoadBalancerDescription> lbs = awsLoadBalancerService.getLoadBalancersWithSecurityGroup(userContext, group)
+
         def details = [
                 group: group,
                 app: applicationService.getRegisteredApplication(userContext, group.groupName),
                 accountNames: configService.awsAccountNames,
-                editable: awsEc2Service.isSecurityGroupEditable(group.groupName)
+                editable: awsEc2Service.isSecurityGroupEditable(group.groupName),
+                launchConfigs: launchConfigs,
+                instances: instances,
+                elbs: lbs
         ]
-        // TODO referenced-from lists would be nice too
         withFormat {
             html { return details }
             xml { new XML(details).render(response) }
@@ -78,7 +105,7 @@ class SecurityController {
         }
     }
 
-    def create = {
+    def create() {
         UserContext userContext = UserContext.of(request)
         String name = params.id ?: params.name
         String description = ''
@@ -89,9 +116,11 @@ class SecurityController {
         } else {
             applications = applicationService.getRegisteredApplications(userContext)
         }
+        Subnets subnets = awsEc2Service.getSubnets(userContext)
+        Collection<String> vpcIds = subnets.mapPurposeToVpcId().values() as Set
         [
             applications: applications,
-            vpcIds: awsEc2Service.getVpcs(userContext)*.vpcId,
+            vpcIds: vpcIds,
             selectedVpcIds: params.selectedVpcIds,
             enableVpc: params.enableVpc,
             name: name,
@@ -99,16 +128,17 @@ class SecurityController {
         ]
     }
 
-    def save = { SecurityCreateCommand cmd ->
+    def save(SecurityCreateCommand cmd) {
         if (cmd.hasErrors()) {
-            chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass both the errors and the params
+            chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass both errors and params
         } else {
             UserContext userContext = UserContext.of(request)
             String name = Relationships.buildAppDetailName(params.appName, params.detail)
             try {
                 SecurityGroup securityGroup = awsEc2Service.getSecurityGroup(userContext, name)
                 if (!securityGroup) {
-                    securityGroup = awsEc2Service.createSecurityGroup(userContext, name, params.description, params.vpcId)
+                    securityGroup = awsEc2Service.createSecurityGroup(userContext, name, params.description,
+                            params.vpcId)
                     flash.message = "Security Group '${name}' has been created."
                 } else {
                     flash.message = "Security Group '${name}' already exists."
@@ -121,7 +151,7 @@ class SecurityController {
         }
     }
 
-    def edit = {
+    def edit() {
         UserContext userContext = UserContext.of(request)
         String id = params.id
         SecurityGroup group = awsEc2Service.getSecurityGroup(userContext, id)
@@ -136,7 +166,7 @@ class SecurityController {
         ]
     }
 
-    def update = {
+    def update() {
         String name = params.name ?: params.id
         List<String> selectedGroups = Requests.ensureList(params.selectedGroups)
         UserContext userContext = UserContext.of(request)
@@ -161,16 +191,17 @@ class SecurityController {
         }
     }
 
-    private void updateSecurityIngress(UserContext userContext, SecurityGroup targetGroup, List<String> selectedGroups, Map portMap) {
-        awsEc2Service.getSecurityGroups(userContext).each {srcGroup ->
-            boolean wantAccess = selectedGroups.any {it == srcGroup.groupName} && portMap[srcGroup.groupName] != ''
+    private void updateSecurityIngress(UserContext userContext, SecurityGroup targetGroup, List<String> selectedGroups,
+                                       Map portMap) {
+        awsEc2Service.getSecurityGroups(userContext).each { srcGroup ->
+            boolean wantAccess = selectedGroups.any { it == srcGroup.groupName } && portMap[srcGroup.groupName] != ''
             String wantPorts = wantAccess ? portMap[srcGroup.groupName] : null
             List<IpPermission> wantPerms = awsEc2Service.permissionsFromString(wantPorts)
             awsEc2Service.updateSecurityGroupPermissions(userContext, targetGroup, srcGroup, wantPerms)
         }
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
         String name = params.name ?: params.id
         String msg
@@ -190,7 +221,9 @@ class SecurityController {
         }
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 }
 
 class SecurityCreateCommand {
@@ -202,7 +235,7 @@ class SecurityCreateCommand {
 
     static constraints = {
 
-        appName(nullable: false, blank: false, validator: { value, command->
+        appName(nullable: false, blank: false, validator: { value, command ->
             UserContext userContext = UserContext.of(Requests.request)
             if (!Relationships.checkName(value)) {
                 return 'application.name.illegalChar'
@@ -218,7 +251,7 @@ class SecurityCreateCommand {
             }
         })
 
-        detail(nullable: true, validator: { value, command->
+        detail(nullable: true, validator: { value, command ->
             if (value && !Relationships.checkDetail(value)) {
                 return 'The detail must be empty or consist of alphanumeric characters and hyphens'
             }

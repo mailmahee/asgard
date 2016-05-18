@@ -68,7 +68,7 @@ class MergedInstanceGroupingService {
      * Returns the merged instances for a given application.
      */
     private List<MergedInstance> getMergedInstancesForApp(UserContext userContext, String appName) {
-        Collection<ApplicationInstance> discList = discoveryService.getAppInstances(userContext, appName, From.CACHE)
+        Collection<ApplicationInstance> discList = discoveryService.getAppInstances(userContext, appName)
 
         List<MergedInstance> instances = discList.collect { appInst ->
             Instance ec2Inst = null
@@ -94,9 +94,10 @@ class MergedInstanceGroupingService {
         }
     }
 
-    private List<MergedInstance> injectGroupNames(UserContext userContext, List<MergedInstance> instances, String appName) {
+    private List<MergedInstance> injectGroupNames(UserContext userContext, List<MergedInstance> instances,
+                                                  String appName) {
 
-        // TODO: This is a good spot to look up all the apps and mark which instances have valid app names. Rename this method.
+        // TODO: Good spot to look up all the apps and mark which instances have valid app names. Rename this method.
         Map<String, AutoScalingGroup> instanceIdsToGroups = [:]
         Collection<AutoScalingGroup> groups = appName ?
             awsAutoScalingService.getAutoScalingGroupsForApp(userContext, appName) :

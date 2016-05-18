@@ -29,7 +29,7 @@
 </tr>
 <tr class="prop">
   <td class="name">Security Groups:</td>
-  <td class="value">[<g:each var="g" in="${launchTemplate.securityGroups}" status="j"><g:if test="${j>0}">, </g:if><g:linkObject type="security" name="${g}"/></g:each>]</td>
+  <td class="value">[<g:each var="g" in="${securityGroups}" status="j"><g:if test="${j>0}">, </g:if><g:securityGroup group="${g}"/></g:each>]</td>
 </tr>
 %{-- Some Amazon APIs expose the user data, others hide it. Don't show blank user data if doing so might be confusing. --}%
 <g:if test="${launchTemplate.userData}">
@@ -59,7 +59,11 @@
 <g:if test="${launchTemplate.blockDeviceMappings}">
   <tr class="prop">
     <td class="name">Block Device Mappings:</td>
-    <td class="value">${launchTemplate.blockDeviceMappings}</td>
+    <td class="value">
+      <g:each var="blockDeviceMapping" in="${launchTemplate.blockDeviceMappings?.sort { it.deviceName }}">
+        <div>${blockDeviceMapping}</div>
+      </g:each>
+    </td>
   </tr>
 </g:if>
 <g:if test="${launchTemplate.iamInstanceProfile}">

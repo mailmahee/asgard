@@ -16,7 +16,7 @@
 package com.netflix.asgard
 
 import com.netflix.asgard.auth.ApiToken
-import com.netflix.asgard.mock.ShiroTestUtil
+import org.apache.shiro.SecurityUtils
 import org.apache.shiro.subject.Subject
 import spock.lang.Specification
 
@@ -25,29 +25,23 @@ class ApiTokenServiceUnitSpec extends Specification {
     ApiToken apiToken
     def configService = Mock(ConfigService)
     def emailerService = Mock(EmailerService)
-    def secretService = Mock(SecretService)
-    ApiTokenService apiTokenService = new ApiTokenService(configService: configService, emailerService: emailerService,
-            secretService: secretService)
+    ApiTokenService apiTokenService = new ApiTokenService(configService: configService, emailerService: emailerService)
 
     def setup() {
         Subject subject = Mock(Subject)
         subject.principal >> 'test@netflix.com'
-        ShiroTestUtil.setSubject(subject)
+        SecurityUtils.metaClass.static.getSubject = { subject }
         apiToken = new ApiToken('ThisPurpose', 'testDL@netflix.com', 90, 'key')
     }
 
-    def cleanup() {
-        ShiroTestUtil.tearDownShiro()
-    }
-
     def 'should validate a valid token'() {
-        given: secretService.apiEncryptionKeys >> ['key']
+        given: configService.apiEncryptionKeys >> ['key']
         when: boolean valid = apiTokenService.tokenValid(apiToken)
         then: valid
     }
 
     def 'should fail on an invalid token'() {
-        given: secretService.apiEncryptionKeys >> ['otherKey']
+        given: configService.apiEncryptionKeys >> ['otherKey']
         when: boolean valid = apiTokenService.tokenValid(apiToken)
         then: !valid
     }
@@ -61,7 +55,7 @@ class ApiTokenServiceUnitSpec extends Specification {
     def 'should send email when token is near expiration'() {
         configService.apiTokenExpiryWarningThresholdDays >> 100
         configService.canonicalServerName >> 'asgardtest'
-        secretService.apiEncryptionKeys >> ['key']
+        configService.apiEncryptionKeys >> ['key']
 
         // initialize cache
         configService.apiTokenExpiryWarningIntervalMinutes >> 360

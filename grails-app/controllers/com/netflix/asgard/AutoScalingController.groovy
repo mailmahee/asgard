@@ -18,12 +18,14 @@ package com.netflix.asgard
 import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.autoscaling.model.Activity
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
+import com.amazonaws.services.autoscaling.model.InstanceMonitoring
 import com.amazonaws.services.autoscaling.model.LaunchConfiguration
 import com.amazonaws.services.autoscaling.model.ScalingPolicy
 import com.amazonaws.services.autoscaling.model.ScheduledUpdateGroupAction
 import com.amazonaws.services.autoscaling.model.SuspendedProcess
 import com.amazonaws.services.cloudwatch.model.MetricAlarm
 import com.amazonaws.services.ec2.model.AvailabilityZone
+import com.amazonaws.services.ec2.model.GroupIdentifier
 import com.amazonaws.services.ec2.model.Image
 import com.amazonaws.services.ec2.model.SecurityGroup
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
@@ -37,6 +39,7 @@ import com.netflix.asgard.model.GroupedInstance
 import com.netflix.asgard.model.InstancePriceType
 import com.netflix.asgard.model.SubnetTarget
 import com.netflix.asgard.model.Subnets
+import com.netflix.frigga.Names
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
@@ -59,11 +62,13 @@ class AutoScalingController {
     def spotInstanceRequestService
     def stackService
 
-    def static allowedMethods = [save: 'POST', update: 'POST', delete: 'POST', postpone: 'POST', pushStart: 'POST']
+    static allowedMethods = [save: 'POST', update: 'POST', delete: 'POST', postpone: 'POST', pushStart: 'POST']
 
-    def index = { redirect(action: 'list', params: params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         Collection<AutoScalingGroup> groups = awsAutoScalingService.getAutoScalingGroups(userContext)
 
@@ -82,7 +87,7 @@ class AutoScalingController {
         // Determine which app names are valid based on ASG names
         List<String> registeredAppNamesList = applicationService.getRegisteredApplications(userContext)*.name
         Set<String> registeredAppNames = new HashSet<String>(registeredAppNamesList)
-        Set<String> groupsWithValidAppNames = new HashSet<String>()
+        Set<String> groupsWithValidAppNames = [] as Set
         groups*.autoScalingGroupName.each { String asgName ->
             if (groupNamesToAppNames[asgName] in registeredAppNames) {
                 groupsWithValidAppNames << asgName
@@ -109,7 +114,7 @@ class AutoScalingController {
 
     static final Integer DEFAULT_ACTIVITIES = 20
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String name = params.name ?: params.id
         AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroup(userContext, name)
@@ -125,7 +130,7 @@ class AutoScalingController {
 
             Collection<LoadBalancerDescription> mismatchedLoadBalancers = group.loadBalancerNames.findResults {
                 LoadBalancerDescription elb = awsLoadBalancerService.getLoadBalancer(userContext, it, From.CACHE)
-                elb?.availabilityZones?.sort() != groupData.availabilityZones ? elb : null
+                elb?.availabilityZones?.sort() == groupData.availabilityZones ? null : elb
             }
             Map<String, List<String>> mismatchedElbNamesToZoneLists = mismatchedLoadBalancers.collectEntries {
                 [it.loadBalancerName, it.availabilityZones.sort()]
@@ -159,6 +164,8 @@ class AutoScalingController {
             String lcName = groupData?.launchConfigurationName
             LaunchConfiguration launchConfig = awsAutoScalingService.getLaunchConfiguration(userContext, lcName)
             Image image = awsEc2Service.getImage(userContext, launchConfig?.imageId, From.CACHE)
+            List<GroupIdentifier> securityGroups = awsEc2Service.getSecurityGroupNameIdPairsByNamesOrIds(userContext,
+                    launchConfig?.securityGroups)
 
             Collection<String> alarmNames = scalingPolicies.collect { it.alarms*.alarmName }.flatten()
             List<MetricAlarm> alarms = awsCloudWatchService.getAlarms(userContext, alarmNames)
@@ -166,7 +173,7 @@ class AutoScalingController {
                 map.put(alarm.alarmName, alarm)
                 map
             } as Map
-
+            String clusterName = Relationships.clusterFromGroupName(name)
             def details = [
                     instanceCount: instanceCount,
                     showPostponeButton: showPostponeButton,
@@ -175,8 +182,9 @@ class AutoScalingController {
                     zonesWithInstanceCounts: zonesWithInstanceCounts,
                     mismatchedElbNamesToZoneLists: mismatchedElbNamesToZoneLists,
                     launchConfiguration: launchConfig,
+                    securityGroups: securityGroups,
                     image: image,
-                    clusterName: Relationships.clusterFromGroupName(name),
+                    clusterName: clusterName,
                     variables: Relationships.dissectCompoundName(name),
                     launchStatus: processTypeToStatusMessage[AutoScalingProcessType.Launch],
                     azRebalanceStatus: processTypeToStatusMessage[AutoScalingProcessType.AZRebalance],
@@ -186,10 +194,11 @@ class AutoScalingController {
                     scheduledActions: scheduledActions,
                     activities: activities,
                     app: applicationService.getRegisteredApplication(userContext, appName),
-                    buildServer: grailsApplication.config.cloud.buildServer,
+                    buildServer: configService.buildServerUrl,
                     alarmsByName: alarmsByName,
                     subnetPurpose: subnetPurpose ?: null,
-                    vpcZoneIdentifier: group.VPCZoneIdentifier
+                    vpcZoneIdentifier: group.VPCZoneIdentifier,
+                    chaosMonkeyEditLink: configService.getMonkeyCommanderEditLink(appName)
             ]
             withFormat {
                 html { return details }
@@ -199,7 +208,7 @@ class AutoScalingController {
         }
     }
 
-    def activities = {
+    def activities() {
         UserContext userContext = UserContext.of(request)
         String groupName = params.id
         Integer count = params.activityCount as Integer
@@ -212,7 +221,7 @@ class AutoScalingController {
         }
     }
 
-    def create = {
+    def create() {
         UserContext userContext = UserContext.of(request)
         List<LoadBalancerDescription> loadBalancers = awsLoadBalancerService.getLoadBalancers(userContext).
                 sort { it.loadBalancerName.toLowerCase() }
@@ -239,6 +248,9 @@ class AutoScalingController {
         }
         Subnets subnets = awsEc2Service.getSubnets(userContext)
         Map<String, String> purposeToVpcId = subnets.mapPurposeToVpcId()
+        String subnetPurpose = params.subnetPurpose ?: null
+        String vpcId = purposeToVpcId[subnetPurpose]
+        Set<String> appsWithClusterOptLevel = []
         [
                 applications: applicationService.getRegisteredApplications(userContext),
                 group: group,
@@ -248,18 +260,20 @@ class AutoScalingController {
                 images: awsEc2Service.getAccountImages(userContext).sort { it.imageLocation.toLowerCase() },
                 defKey: awsEc2Service.defaultKeyName,
                 keys: awsEc2Service.getKeys(userContext).sort { it.keyName.toLowerCase() },
-                subnetPurpose: params.subnetPurpose ?: null,
+                subnetPurpose: subnetPurpose,
                 subnetPurposes: subnets.getPurposesForZones(recommendedZones*.zoneName, SubnetTarget.EC2).sort(),
                 zonesGroupedByPurpose: subnets.groupZonesByPurpose(recommendedZones*.zoneName, SubnetTarget.EC2),
                 selectedZones: selectedZones,
                 purposeToVpcId: purposeToVpcId,
-                vpcId: purposeToVpcId[params.subnetPurpose],
+                vpcId: vpcId,
                 loadBalancersGroupedByVpcId: loadBalancers.groupBy { it.VPCId },
-                selectedLoadBalancers: Requests.ensureList(params.selectedLoadBalancers),
+                selectedLoadBalancers: Requests.ensureList(params["selectedLoadBalancersForVpcId${vpcId ?: ''}"]),
                 securityGroupsGroupedByVpcId: effectiveGroups.groupBy { it.vpcId },
                 selectedSecurityGroups: Requests.ensureList(params.selectedSecurityGroups),
                 instanceTypes: instanceTypeService.getInstanceTypes(userContext),
-                iamInstanceProfile: configService.defaultIamRole
+                iamInstanceProfile: configService.defaultIamRole,
+                spotUrl: configService.spotUrl,
+                appsWithClusterOptLevel: appsWithClusterOptLevel ?: []
         ]
     }
 
@@ -267,38 +281,40 @@ class AutoScalingController {
         s?.isInteger() ? s.toInteger() : null
     }
 
-    def save = { GroupCreateCommand cmd ->
-
+    def save(GroupCreateCommand cmd) {
         if (cmd.hasErrors()) {
-            chain(action: 'create', model: [cmd:cmd], params: params) // Use chain to pass both the errors and the params
+            chain(action: 'create', model: [cmd: cmd], params: params) // Use chain to pass both the errors and params
         } else {
-
+            UserContext userContext = UserContext.of(request)
             // Auto Scaling Group name
             String groupName = Relationships.buildGroupName(params)
-            UserContext userContext = UserContext.of(request)
+            Subnets subnets = awsEc2Service.getSubnets(userContext)
+            String subnetPurpose = params.subnetPurpose ?: null
+            String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
 
             // Auto Scaling Group
-            def minSize = params.min ?: 0
-            def desiredCapacity = params.desiredCapacity ?: 0
-            def maxSize = params.max ?: 0
-            def defaultCooldown = params.defaultCooldown ?: 10
+            Integer minSize = (params.min ?: 0) as Integer
+            Integer desiredCapacity = (params.desiredCapacity ?: 0) as Integer
+            Integer maxSize = (params.max ?: 0) as Integer
+            desiredCapacity = Ensure.bounded(minSize, desiredCapacity, maxSize)
+            Integer defaultCooldown = (params.defaultCooldown ?: 10) as Integer
             String healthCheckType = AutoScalingGroupHealthCheckType.ensureValidType(params.healthCheckType)
             Integer healthCheckGracePeriod = params.healthCheckGracePeriod as Integer
             List<String> terminationPolicies = Requests.ensureList(params.terminationPolicy)
             List<String> availabilityZones = Requests.ensureList(params.selectedZones)
-            List<String> loadBalancerNames = Requests.ensureList(params.selectedLoadBalancers)
+            List<String> loadBalancerNames = Requests.ensureList(params["selectedLoadBalancersForVpcId${vpcId}"] ?:
+                    params["selectedLoadBalancers"])
             AutoScalingGroup groupTemplate = new AutoScalingGroup().withAutoScalingGroupName(groupName).
                     withAvailabilityZones(availabilityZones).withLoadBalancerNames(loadBalancerNames).
-                    withMinSize(minSize.toInteger()).withDesiredCapacity(desiredCapacity.toInteger()).
-                    withMaxSize(maxSize.toInteger()).withDefaultCooldown(defaultCooldown.toInteger()).
+                    withMinSize(minSize).withDesiredCapacity(desiredCapacity).
+                    withMaxSize(maxSize).withDefaultCooldown(defaultCooldown).
                     withHealthCheckType(healthCheckType).withHealthCheckGracePeriod(healthCheckGracePeriod).
                     withTerminationPolicies(terminationPolicies)
 
             // If this ASG lauches VPC instances, we must find the proper subnets and add them.
-            String subnetPurpose = params.subnetPurpose ?: null
             if (subnetPurpose) {
-                List<String> subnetIds = awsEc2Service.getSubnets(userContext).
-                        getSubnetIdsForZones(availabilityZones, subnetPurpose, SubnetTarget.EC2)
+                List<String> subnetIds = subnets.getSubnetIdsForZones(availabilityZones, subnetPurpose,
+                        SubnetTarget.EC2)
                 groupTemplate.withVPCZoneIdentifier(Relationships.vpcZoneIdentifierFromSubnetIds(subnetIds))
             }
 
@@ -311,30 +327,34 @@ class AutoScalingController {
             String imageId = params.imageId
             String keyName = params.keyName
             List<String> securityGroups = Requests.ensureList(params.selectedSecurityGroups)
-            String instanceType = params.instanceType
+            String instType = params.instanceType
             String kernelId = params.kernelId ?: null
             String ramdiskId = params.ramdiskId ?: null
             String iamInstanceProfile = params.iamInstanceProfile ?: configService.defaultIamRole
+            boolean ebsOptimized = params.ebsOptimized?.toBoolean()
+            boolean enableMonitoring = params.enableInstanceMonitoring ? params.enableInstanceMonitoring.toBoolean() :
+                    configService.enableInstanceMonitoring
             LaunchConfiguration launchConfigTemplate = new LaunchConfiguration().withImageId(imageId).
-                    withKernelId(kernelId).withInstanceType(instanceType).withKeyName(keyName).withRamdiskId(ramdiskId).
-                    withSecurityGroups(securityGroups).withIamInstanceProfile(iamInstanceProfile)
+                    withKernelId(kernelId).withInstanceType(instType).withKeyName(keyName).withRamdiskId(ramdiskId).
+                    withSecurityGroups(securityGroups).withIamInstanceProfile(iamInstanceProfile).
+                    withEbsOptimized(ebsOptimized).withInstanceMonitoring(new InstanceMonitoring()
+                        .withEnabled(enableMonitoring))
             if (params.pricing == InstancePriceType.SPOT.name()) {
-                launchConfigTemplate.spotPrice = spotInstanceRequestService.recommendSpotPrice(userContext, instanceType)
+                launchConfigTemplate.spotPrice = spotInstanceRequestService.recommendSpotPrice(userContext, instType)
             }
-
             CreateAutoScalingGroupResult result = awsAutoScalingService.createLaunchConfigAndAutoScalingGroup(
                     userContext, groupTemplate, launchConfigTemplate, suspendedProcesses)
             flash.message = result.toString()
             if (result.succeeded()) {
                 redirect(action: 'show', params: [id: groupName])
-            }
-            else {
+            } else {
                 chain(action: 'create', model: [cmd: cmd], params: params)
             }
         }
     }
 
-    def edit = {
+    @SuppressWarnings("ReturnsNullInsteadOfEmptyCollection")
+    def edit() {
         UserContext userContext = UserContext.of(request)
         String name = params.name ?: params.id
         AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroup(userContext, name)
@@ -346,6 +366,10 @@ class AutoScalingController {
         List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(group.VPCZoneIdentifier)
         String subnetPurpose = awsEc2Service.getSubnets(userContext).coerceLoneOrNoneFromIds(subnetIds)?.purpose
         Collection<AvailabilityZone> availabilityZones = awsEc2Service.getAvailabilityZones(userContext)
+        boolean launchSuspended = group?.isProcessSuspended(AutoScalingProcessType.Launch)
+        boolean terminateSuspended = group?.isProcessSuspended(AutoScalingProcessType.Terminate)
+        boolean alarmNotesSuspended = group?.isProcessSuspended(AutoScalingProcessType.AlarmNotifications)
+        boolean manualStaticSizingNeeded = awsAutoScalingService.shouldGroupBeManuallySized(userContext, group)
         return [
                 group: group,
                 loadBalancers: awsLoadBalancerService.getLoadBalancers(userContext),
@@ -356,14 +380,16 @@ class AutoScalingController {
                 subnetPurpose: params.subnetPurpose ?: subnetPurpose,
                 zonesGroupedByPurpose: subnets.groupZonesByPurpose(availabilityZones*.zoneName, SubnetTarget.EC2),
                 selectedZones: Requests.ensureList(params.selectedZones) ?: group?.availabilityZones,
-                launchSuspended: group?.isProcessSuspended(AutoScalingProcessType.Launch),
-                terminateSuspended: group?.isProcessSuspended(AutoScalingProcessType.Terminate),
+                launchSuspended: launchSuspended,
+                terminateSuspended: terminateSuspended,
+                alarmNotificationsSuspended: alarmNotesSuspended,
                 addToLoadBalancerSuspended: group?.isProcessSuspended(AutoScalingProcessType.AddToLoadBalancer),
+                manualStaticSizingNeeded: manualStaticSizingNeeded,
                 vpcZoneIdentifier: group.VPCZoneIdentifier,
         ]
     }
 
-    def update = {
+    def update() {
         Map<String, AutoScalingProcessType> processes = AutoScalingProcessType.with { [
                 azRebalance: AZRebalance,
                 launch: Launch,
@@ -384,48 +410,40 @@ class AutoScalingController {
         Integer desiredCapacity = (params.desiredCapacity ?: 0) as Integer
         Integer maxSize = (params.max ?: 0) as Integer
         def nextAction = 'show'
-
-        if (minSize > desiredCapacity) {
-            flash.message = "Error: Minimum size ${minSize} is lower than desired capacity ${desiredCapacity}"
-            nextAction = 'edit'
-        } else if (desiredCapacity > maxSize) {
-            flash.message = "Error: Desired capacity ${desiredCapacity} is lower than max size ${maxSize}"
-            nextAction = 'edit'
-        } else {
-            AutoScalingGroup asg = awsAutoScalingService.getAutoScalingGroup(userContext, name)
-            String lcName = params.launchConfiguration
-            Integer defaultCooldown = (params.defaultCooldown ?: 10) as Integer
-            String healthCheckType = AutoScalingGroupHealthCheckType.ensureValidType(params.healthCheckType)
-            Integer healthCheckGracePeriod = params.healthCheckGracePeriod as Integer
-            List<String> terminationPolicies = Requests.ensureList(params.terminationPolicy) ?: asg.terminationPolicies
-            List<String> availabilityZones = Requests.ensureList(params.selectedZones)
-            Collection<AutoScalingProcessType> suspendProcesses = Sets.newHashSet()
-            Collection<AutoScalingProcessType> resumeProcesses = Sets.newHashSet()
-            processes.each { String paramName, AutoScalingProcessType processType ->
-                if (params[paramName] in ['disabled']) {
-                    suspendProcesses << processType
-                }
-                if (params[paramName] in ['enabled']) {
-                    resumeProcesses << processType
-                }
+        desiredCapacity = Ensure.bounded(minSize, desiredCapacity, maxSize)
+        AutoScalingGroup asg = awsAutoScalingService.getAutoScalingGroup(userContext, name)
+        String lcName = params.launchConfiguration
+        Integer defaultCooldown = (params.defaultCooldown ?: 10) as Integer
+        String healthCheckType = AutoScalingGroupHealthCheckType.ensureValidType(params.healthCheckType)
+        Integer healthCheckGracePeriod = params.healthCheckGracePeriod as Integer
+        List<String> terminationPolicies = Requests.ensureList(params.terminationPolicy) ?: asg.terminationPolicies
+        List<String> availabilityZones = Requests.ensureList(params.selectedZones)
+        Collection<AutoScalingProcessType> suspendProcesses = Sets.newHashSet()
+        Collection<AutoScalingProcessType> resumeProcesses = Sets.newHashSet()
+        processes.each { String paramName, AutoScalingProcessType processType ->
+            if (params[paramName] in ['disabled']) {
+                suspendProcesses << processType
             }
-            final AutoScalingGroupData autoScalingGroupData = AutoScalingGroupData.forUpdate(
-                    name, lcName, minSize, desiredCapacity, maxSize, defaultCooldown, healthCheckType,
-                    healthCheckGracePeriod, terminationPolicies, availabilityZones
-            )
-            try {
-                awsAutoScalingService.updateAutoScalingGroup(userContext, autoScalingGroupData, suspendProcesses,
-                        resumeProcesses)
-                flash.message = "AutoScaling Group '${name}' has been updated."
-            } catch (Exception e) {
-                flash.message = "Could not update AutoScaling Group: ${e}"
-                nextAction = 'edit'
+            if (params[paramName] in ['enabled']) {
+                resumeProcesses << processType
             }
+        }
+        final AutoScalingGroupData autoScalingGroupData = AutoScalingGroupData.forUpdate(
+                name, lcName, minSize, desiredCapacity, maxSize, defaultCooldown, healthCheckType,
+                healthCheckGracePeriod, terminationPolicies, availabilityZones
+        )
+        try {
+            awsAutoScalingService.updateAutoScalingGroup(userContext, autoScalingGroupData, suspendProcesses,
+                    resumeProcesses)
+            flash.message = "AutoScaling Group '${name}' has been updated."
+        } catch (Exception e) {
+            flash.message = "Could not update AutoScaling Group: ${e}"
+            nextAction = 'edit'
         }
         redirect(action: nextAction, params: [id: name])
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
         String name = params.name
         AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroup(userContext, name)
@@ -450,21 +468,21 @@ class AutoScalingController {
         showGroupNext ? redirect(action: 'show', params: [id: name]) : redirect(action: 'list')
     }
 
-    def postpone = {
+    def postpone() {
         UserContext userContext = UserContext.of(request)
         String name = params.name
         awsAutoScalingService.postponeExpirationTime(userContext, name, Duration.standardDays(1))
         redirect(action: 'show', id: name)
     }
 
-    def generateName = {
-        withFormat {
+    def generateName() {
+        request.withFormat {
             json {
                 if (params.appName) {
                     try {
                         String groupName = Relationships.buildGroupName(params, true)
-                        List<String> envVars = Relationships.labeledEnvironmentVariables(groupName,
-                                configService.userDataVarPrefix)
+                        List<String> envVars = Relationships.labeledEnvVarsMap(Names.parseName(groupName),
+                                configService.userDataVarPrefix).collect { k, v -> "${k}=${v}" }
                         Map result = [groupName: groupName, envVars: envVars]
                         render(result as JSON)
                     } catch (Exception e) {
@@ -479,22 +497,24 @@ class AutoScalingController {
         }
     }
 
-    def anyInstance = {
+    def anyInstance() {
         UserContext userContext = UserContext.of(request)
         String name = params.name ?: params.id
         String field = params.field
+        if (!name || !field) {
+            response.status = 400
+            if (!name) { render 'name is a required parameter' }
+            if (!field) { render 'field is a required parameter' }
+            return
+        }
         AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroup(userContext, name)
-        List instances = group?.instances
-        String instanceId = instances?.size() >= 1 ? instances[0].instanceId : null
-        MergedInstance mergedInstance = instanceId ?
-                mergedInstanceService.getMergedInstancesByIds(userContext, [instanceId])[0] : null
+        List<String> instanceIds = group?.instances*.instanceId
+        MergedInstance mergedInstance = mergedInstanceService.findHealthyInstance(userContext, instanceIds)
         String result = mergedInstance?.getFieldValue(field)
         if (!result) {
-            response.status = 400
-            if (!name) { result = 'name is a required parameter'}
-            else if (!field) { result = 'field is a required parameter'}
-            else if (!group) { result = "No auto scaling group found with name '$name'"}
-            else if (!mergedInstance) { result = "No instances found for auto scaling group '$name'"}
+            response.status = 404
+            if (!group) { result = "No auto scaling group found with name '$name'" }
+            else if (!mergedInstance) { result = "No instances found for auto scaling group '$name'" }
             else { result = "'$field' not found. Valid fields: ${mergedInstance.listFieldNames()}" }
         }
         render result
@@ -503,7 +523,7 @@ class AutoScalingController {
     /**
      * TODO: This endpoint can be removed when ASG tagging is stable and more trusted
      */
-    def removeExpirationTime = {
+    def removeExpirationTime() {
         UserContext userContext = UserContext.of(request)
         String name = params.id ?: params.name
         awsAutoScalingService.removeExpirationTime(userContext, name)
@@ -511,7 +531,7 @@ class AutoScalingController {
         redirect(action: 'show', id: name)
     }
 
-    def imageless = {
+    def imageless() {
         UserContext userContext = UserContext.of(request)
         List<AppRegistration> allApps = applicationService.getRegisteredApplications(userContext)
         Collection<AutoScalingGroup> allGroups = awsAutoScalingService.getAutoScalingGroups(userContext)

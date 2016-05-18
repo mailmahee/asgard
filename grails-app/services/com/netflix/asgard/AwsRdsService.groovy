@@ -86,7 +86,18 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
     // Instances
 
     private List<DBInstance> retrieveDBInstances(Region region) {
-        awsClient.by(region).describeDBInstances(new DescribeDBInstancesRequest()).getDBInstances()
+        def result = awsClient.by(region).describeDBInstances(new DescribeDBInstancesRequest())
+        def dbInstances = []
+        while (true) {
+            dbInstances.addAll result.DBInstances
+            if (result.marker) {
+                result = awsClient.by(region)
+                        .describeDBInstances(new DescribeDBInstancesRequest().withMarker(result.marker))
+            } else {
+                break
+            }
+        }
+        dbInstances
     }
 
     Collection<DBInstance> getDBInstances(UserContext userContext) {
@@ -115,11 +126,12 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
         }, Link.to(EntityType.rdsInstance, dbInstanceId))
     }
 
-    DBInstance createDBInstance(UserContext userContext, DBInstance templateDbInstance, String masterUserPassword, Integer port) {
+    DBInstance createDBInstance(UserContext userContext, DBInstance templateDbInstance, String masterUserPassword,
+                                Integer port) {
         final BeanState templateDbInstanceState = BeanState.ofSourceBean(templateDbInstance)
         final CreateDBInstanceRequest request = templateDbInstanceState.injectState(new CreateDBInstanceRequest())
         request.masterUserPassword = masterUserPassword
-        if (port) {request.setPort(port)}
+        if (port) { request.setPort(port) }
         taskService.runTask(userContext, "Creating DB instance '${templateDbInstance.DBInstanceIdentifier}'", { task ->
             final DBInstance createdInstance = awsClient.by(userContext.region).createDBInstance(request)
             caches.allDBInstances.by(userContext.region).put(createdInstance.getDBInstanceIdentifier(), createdInstance)
@@ -127,7 +139,7 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
         getDBInstance(userContext, templateDbInstance.DBInstanceIdentifier)
     }
 
-    static List getDBInstanceClasses(){
+    static List getDBInstanceClasses() {
         [SMALL, LARGE, EXTRA_LARGE, DOUBLE_EXTRA_LARGE, QUADRUPLE_EXTRA_LARGE]
     }
 
@@ -151,7 +163,7 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
                 .withMultiAZ(multiAZ)
                 .withPreferredBackupWindow(preferredBackupWindow)
                 .withPreferredMaintenanceWindow(preferredMaintenanceWindow)
-            if (masterUserPassword) request.setMasterUserPassword(masterUserPassword)
+            if (masterUserPassword) { request.setMasterUserPassword(masterUserPassword) }
             DBInstance instance = awsClient.by(userContext.region).modifyDBInstance(request)
             caches.allDBInstances.by(userContext.region).put(instance.getDBInstanceIdentifier(), instance)
         }, Link.to(EntityType.rdsInstance, dbInstanceId))
@@ -187,8 +199,8 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
 
     DBSecurityGroup createDBSecurityGroup(UserContext userContext, String name, String description) {
         taskService.runTask(userContext, "Create DB Security Group '${name}'", { task ->
-            awsClient.by(userContext.region).createDBSecurityGroup(
-                new CreateDBSecurityGroupRequest().withDBSecurityGroupName(name).withDBSecurityGroupDescription(description))
+            awsClient.by(userContext.region).createDBSecurityGroup(new CreateDBSecurityGroupRequest().
+                    withDBSecurityGroupName(name).withDBSecurityGroupDescription(description))
         }, Link.to(EntityType.dbSecurity, name))
         getDBSecurityGroup(userContext, name)
     }
@@ -208,9 +220,10 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
         taskService.runTask(userContext, msg, { Task task ->
             removeDBSecurityGroup(userContext, group.getDBSecurityGroupName())
             createDBSecurityGroup(userContext, newName, description)
-            group.ipPermissions.each {perm ->
-                perm.userIdGroupPairs.each {pair ->
-                    authorizeDBSecurityGroupIngress(newName, pair.groupName, perm.ipProtocol, perm.fromPort, perm.toPort)
+            group.ipPermissions.each { perm ->
+                perm.userIdGroupPairs.each { pair ->
+                    authorizeDBSecurityGroupIngress(newName, pair.groupName, perm.ipProtocol, perm.fromPort,
+                            perm.toPort)
                 }
             }
         }, Link.to(EntityType.dbSecurity, newName))
@@ -220,7 +233,8 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
     DBSecurityGroup authorizeDBSecurityGroupIngressForGroup(UserContext userContext, String groupName,
                                                             String ec2SecurityGroupName) {
         String sourceSecurityGroupOwnerId = accounts[0]
-        taskService.runTask(userContext, "Authorize DB Security Group Ingress for '${ec2SecurityGroupName}'", { Task task ->
+        String taskName = "Authorize DB Security Group Ingress for '${ec2SecurityGroupName}'"
+        taskService.runTask(userContext, taskName, { Task task ->
             awsClient.by(userContext.region).authorizeDBSecurityGroupIngress(
                 new AuthorizeDBSecurityGroupIngressRequest()
                     .withDBSecurityGroupName(groupName)
@@ -301,9 +315,17 @@ class AwsRdsService implements CacheInitializer, InitializingBean {
             return caches.allDBSnapshots.by(userContext.region).get(dbSnapshotId)
         }
         DescribeDBSnapshotsRequest request = new DescribeDBSnapshotsRequest().withDBSnapshotIdentifier(dbSnapshotId)
-        DescribeDBSnapshotsResult result = awsClient.by(userContext.region).describeDBSnapshots(request)
-        DBSnapshot snapshot = Check.loneOrNone(result.getDBSnapshots(), DBSnapshot)
-        caches.allDBSnapshots.by(userContext.region).put(snapshot.getDBSnapshotIdentifier(), snapshot)
+        DBSnapshot snapshot = null
+        try {
+            DescribeDBSnapshotsResult result = awsClient.by(userContext.region).describeDBSnapshots(request)
+            snapshot = Check.loneOrNone(result.getDBSnapshots(), DBSnapshot)
+        } catch (AmazonServiceException ase) {
+            // Check for the specific code the RDS service uses when an object does not exist.
+            if (ase.errorCode != 'DBSnapshotNotFound') {
+                throw ase
+            }
+        }
+        caches.allDBSnapshots.by(userContext.region).put(dbSnapshotId, snapshot)
         snapshot
     }
 

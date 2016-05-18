@@ -15,21 +15,23 @@
  */
 package com.netflix.asgard
 
+import com.amazonaws.SDKGlobalConfiguration
 import com.netflix.asgard.server.ServerState
 import com.netflix.asgard.server.SwitchAttemptResult
 import grails.converters.JSON
 import grails.converters.XML
-import org.codehaus.groovy.grails.commons.ApplicationHolder
 
 class ServerController {
 
     def serverService
     def taskService
-    static Set<String> hostNames = new TreeSet<String>()
+    def witherService
 
-    def index = { render InetAddress.localHost.hostName }
+    def index() {
+        render InetAddress.localHost.hostName
+    }
 
-    def all = {
+    def all() {
         List<ServerState> serverStates = serverService.generateAllServersReport()
         List<Map> report = serverStates.collect { Meta.toMap(it) }
         def output = flash.messages ? [result: flash.messages, servers: report] : report
@@ -40,25 +42,43 @@ class ServerController {
         }
     }
 
-    def ip = { render InetAddress.localHost.hostAddress }
+    def ip() {
+        render InetAddress.localHost.hostAddress
+    }
 
-    def version = { render "${ApplicationHolder.application.metadata['app.version']}" }
+    def version() {
+        render serverService.version
+    }
 
-    def build = { render "${grailsApplication.config.build.number}" }
+    def build() {
+        render "${grailsApplication.config.build.number}"
+    }
 
-    def change = { render "${grailsApplication.config.scm.commit}" }
+    def change() {
+        render "${grailsApplication.config.scm.commit}"
+    }
 
-    def waitingToMoveTraffic = { render "${serverService.isThisServerWaitingToMoveTraffic()}" }
+    def waitingToMoveTraffic() {
+        render "${serverService.isThisServerWaitingToMoveTraffic()}"
+    }
 
-    def env = { render "${grailsApplication.config.cloud.accountName}" }
+    def env() {
+        render "${grailsApplication.config.cloud.accountName}"
+    }
 
-    def users = { render hostNames.join("\n") }
+    def hoursSinceStartup() {
+        render "${serverService.getHoursSinceStartup()}"
+    }
 
-    def hoursSinceStartup = { render "${serverService.getHoursSinceStartup()}" }
+    def minutesSinceStartup() {
+        render "${serverService.getMinutesSinceStartup()}"
+    }
 
-    def minutesSinceStartup = { render "${serverService.getMinutesSinceStartup()}" }
+    def uptime() {
+        render "${serverService.getUptimeString()}"
+    }
 
-    def moveTraffic = {
+    def moveTraffic() {
         String targetServer = pickServer(params)
         String forceNowValue = params.forceNow
         SwitchAttemptResult switchAttemptResult = serverService.moveTrafficTo(targetServer, forceNowValue)
@@ -66,32 +86,65 @@ class ServerController {
         redirect(action: 'all', params: [format: 'json'])
     }
 
-    def startTrafficMover = {
+    def startTrafficMover() {
         String targetServer = pickServer(params)
         serverService.startTrafficMover(targetServer)
         flash.messages = ['Started thread to move traffic after tasks finish on sister server']
         redirect(action: 'all', params: [format: 'json'])
     }
 
-    def cancelTrafficMover = {
+    def cancelTrafficMover() {
         flash.messages = serverService.cancelTrafficMover()
         redirect(action: 'all', params: [format: 'json'])
     }
 
-    def runningTaskCount = {
-        render taskService.getRunning().size() as String
+    def runningTaskCount() {
+        render taskService.getLocalRunningInMemory().size() as String
+    }
+
+    /**
+     * Starts a thread that will wait until there are zero local in-memory tasks, and then will attempt to terminate
+     * this Asgard instance within the instance's Auto Scaling Group.
+     *
+     * @see WitherService#startWither()
+     */
+    def startWither() {
+        witherService.startWither()
+        flash.messages = ['Started withering process to terminate current instance or ASG after tasks are drained']
+        redirect(action: 'all', params: [format: 'json'])
+    }
+
+    /**
+     * Aborts the current withering thread.
+     */
+    def cancelWither() {
+        flash.messages = witherService.cancelWither()
+        redirect(action: 'all', params: [format: 'json'])
     }
 
     /**
      * Displays all environment variables and system properties for debugging.
      */
-    def props = {
-        Map<String, String> envVars = System.getenv().sort { it.key.toLowerCase() }
-        Map<String, String> systemProperties = [:]
-        for (String name in System.properties.stringPropertyNames().sort { it.toLowerCase() }) {
-            systemProperties.put(name, System.getProperty(name))
+    def props() {
+        Properties sysProps = serverService.systemProperties
+        Map<String, String> propsMap = sysProps.stringPropertyNames().sort { it.toLowerCase() }.collectEntries {
+            [it, sysProps.getProperty(it)]
         }
-        Map<String, Map<String, String>> output = [environmentVariables: envVars, systemProperties: systemProperties]
+        Map<String, String> envVars = serverService.environmentVariables.sort { it.key.toLowerCase() }
+        // Hide known sensitive info such as AWS credentials
+        List<String> keysToHide = [
+            SDKGlobalConfiguration.ACCESS_KEY_ENV_VAR, SDKGlobalConfiguration.ACCESS_KEY_SYSTEM_PROPERTY,
+            SDKGlobalConfiguration.ALTERNATE_ACCESS_KEY_ENV_VAR, SDKGlobalConfiguration.SECRET_KEY_ENV_VAR,
+            SDKGlobalConfiguration.SECRET_KEY_SYSTEM_PROPERTY, SDKGlobalConfiguration.ALTERNATE_SECRET_KEY_ENV_VAR
+        ]
+        for (String key in keysToHide) {
+            for (Map map in [envVars, propsMap]) {
+                if (map[key]) {
+                    map[key] = '[hidden]'
+                }
+            }
+        }
+        Map<String, Map<String, String>> output = [environmentVariables: envVars, systemProperties: propsMap]
         withFormat {
             html { output }
             json { new JSON(output).render(response) }

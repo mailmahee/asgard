@@ -44,6 +44,14 @@
           </tr>
           <tr class="prop">
             <td class="name">
+              <label for="group">App Group:</label>
+            </td>
+            <td class="value">
+              <input type="text" id="group" name="group" value="${app.group}"/>
+            </td>
+          </tr>
+          <tr class="prop">
+            <td class="name">
               <label for="type">Type:</label>
             </td>
             <td class="value">
@@ -79,6 +87,14 @@
             </td>
             <td class="value">
               <input type="email" id="email" name="email" value="${app.email}"/>
+            </td>
+          </tr>
+          <tr class="prop">
+            <td class="name">
+              <label for="tags">Tags:</label>
+            </td>
+            <td class="value">
+              <input type="text" id="tags" name="tags" value="${app.tags.join(',') ?: ''}"/>
             </td>
           </tr>
           <tr class="prop">

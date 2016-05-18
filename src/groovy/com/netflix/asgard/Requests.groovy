@@ -15,6 +15,7 @@
  */
 package com.netflix.asgard
 
+import java.util.regex.Pattern
 import javax.servlet.http.HttpServletRequest
 import javax.servlet.http.HttpServletResponse
 import org.codehaus.groovy.grails.web.servlet.FlashScope
@@ -23,6 +24,22 @@ import org.codehaus.groovy.grails.web.servlet.mvc.GrailsWebRequest
 import org.springframework.web.context.request.RequestContextHolder
 
 class Requests {
+
+    /**
+     * The regex pattern to identify user agent strings sent by browsers, as opposed to scripting libraries and tools
+     * such as curl.
+     */
+    static final Pattern BROWSER_USER_AGENT_PATTERN = Pattern.compile('.*(Mozilla|Chrome|Firefox|Safari|MSIE|Opera).*')
+
+    /**
+     * Determines whether an incoming request is from a web browser or not.
+     *
+     * @param request the http servlet request to analyze
+     * @return true if the request's user agent string matches a browser user agent pattern
+     */
+    static boolean isBrowser(HttpServletRequest request) {
+        request.getHeader('user-agent')?.matches(BROWSER_USER_AGENT_PATTERN)
+    }
 
     static HttpServletRequest getRequest() {
         GrailsWebRequest webRequest = (GrailsWebRequest) RequestContextHolder.currentRequestAttributes()
@@ -87,11 +104,11 @@ class Requests {
         }
         if (value instanceof Map) {
             output += '[\n'
-            value.each { k, v ->  output += prettyPrint(v, indent + 5, k) }
+            value.each { k, v -> output += prettyPrint(v, indent + 5, k) }
             output += "${spaces}]\n"
-        } else if  (value instanceof Collection || value?.class?.array) {
+        } else if (value instanceof Collection || value?.class?.array) {
             output += '[\n'
-            value.each { it -> output += prettyPrint(it, indent + 5)}
+            value.each { it -> output += prettyPrint(it, indent + 5) }
             output += "${spaces}]\n"
         } else {
             if (value?.hasProperty('name') && value?.hasProperty('value')) {
@@ -109,7 +126,8 @@ class Requests {
         if (stringParam instanceof String) { return [ stringParam ] }
         if (stringParam instanceof List) { return stringParam }
         if (stringParam instanceof String[]) { return stringParam as List }
-        throw new IllegalArgumentException("Expected a string or a list for ${stringParam} but got a ${stringParam.class.name}")
+        String msg = "Expected a string or a list for ${stringParam} but got a ${stringParam.class.name}"
+        throw new IllegalArgumentException(msg)
     }
 
     /**
@@ -119,7 +137,9 @@ class Requests {
      */
     static void preventCaching(HttpServletResponse response) {
         response.setHeader('Cache-Control', 'no-cache') // HTTP 1.1
-        response.addHeader('Cache-Control', "no-store") // http://stackoverflow.com/questions/866822/why-both-no-cache-and-no-store-should-be-used-in-http-response
+
+        // http://stackoverflow.com/questions/866822/why-both-no-cache-and-no-store-should-be-used-in-http-response
+        response.addHeader('Cache-Control', "no-store")
         response.setHeader('Pragma', 'no-cache') // HTTP 1.0
         response.setDateHeader ('Expires', 0) // Prevent caching at the proxy server
     }
@@ -138,7 +158,7 @@ class Requests {
     }
 
     static String getBaseUrl(HttpServletRequest request) {
-        String port = (request.serverPort && request.serverPort) != 80 ? ":${request.serverPort}" : ''
+        String port = (request.serverPort && request.serverPort) == 80 ? '' : ":${request.serverPort}"
         "${request.scheme}://${request.serverName}${port}"
     }
 

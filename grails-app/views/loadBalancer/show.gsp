@@ -61,6 +61,10 @@
           </td>
         </tr>
         <tr class="prop">
+          <td class="name">Policies:</td>
+          <td class="value">${loadBalancer.policies.otherPolicies}</td>
+        </tr>
+        <tr class="prop">
           <td class="name">VPC Purpose:</td>
           <td class="value">${subnetPurpose}</td>
         </tr>
@@ -68,6 +72,16 @@
           <td class="name">Subnets:</td>
           <td class="value">${loadBalancer.subnets}</td>
         </tr>
+        <g:if test="${securityGroups}">
+          <tr class="prop">
+            <td class="name">Security Groups:</td>
+            <td class="value">
+              <g:each in="${securityGroups}" var="securityGroup">
+                  <div><g:securityGroup group="${securityGroup}"/></div>
+              </g:each>
+            </td>
+          </tr>
+        </g:if>
         <tr class="prop">
           <td class="name">Listeners:</td>
           <td>
@@ -138,8 +152,8 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <g:each var="is" in="${instanceStates}">
-                    <tr>
+                  <g:each var="is" in="${instanceStates}" status="i">
+                    <tr class="${(i % 2) == 0 ? 'odd' : 'even'}">
                       <td><g:linkObject type="instance" name="${is.instanceId}"/></td>
                       <td><g:availabilityZone value="${is.availabilityZone}"/></td>
                       <td><g:linkObject type="autoScaling" name="${is.autoScalingGroupName}"/></td>

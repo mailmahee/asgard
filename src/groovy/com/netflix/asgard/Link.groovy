@@ -15,13 +15,16 @@
  */
 package com.netflix.asgard
 
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.fasterxml.jackson.annotation.JsonProperty
 import groovy.transform.Immutable
 
 @Immutable final class Link {
     EntityType type
     String id
 
-    static Link to(EntityType type, String id) {
+    @JsonCreator
+    static Link to(@JsonProperty('type') EntityType type, @JsonProperty('id') String id) {
         new Link(type: type, id: id)
     }
 }

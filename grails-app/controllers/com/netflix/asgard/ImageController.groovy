@@ -41,13 +41,17 @@ class ImageController {
     def taskService
     def grailsApplication
 
-    def static allowedMethods = [update: 'POST', delete: ['POST', 'DELETE'], launch: 'POST', addTag: 'POST',
+    static allowedMethods = [update: 'POST', delete: ['POST', 'DELETE'], launch: 'POST', addTag: 'POST',
             addTags: 'POST', removeTag: ['POST', 'DELETE'], removeTags: ['POST', 'DELETE'], removeAllTags: 'DELETE',
             massDelete: ['POST', 'DELETE']]
 
-    def index = { redirect(action: 'list', params:params) }
+    static editActions = ['prelaunch']
 
-    def list = {
+    def index() {
+        redirect(action: 'list', params: params)
+    }
+
+    def list() {
         UserContext userContext = UserContext.of(request)
         Collection<Image> images = []
         Set<String> packageNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
@@ -65,7 +69,7 @@ class ImageController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String imageId = EntityType.image.ensurePrefix(params.imageId ?: params.id)
         Image image = imageId ? awsEc2Service.getImage(userContext, imageId) : null
@@ -94,7 +98,7 @@ class ImageController {
         }
     }
 
-    def edit = {
+    def edit() {
         UserContext userContext = UserContext.of(request)
         def launchUsers = []
         def imageId = EntityType.image.ensurePrefix(params.imageId ?: params.id)
@@ -105,15 +109,17 @@ class ImageController {
             flash.message = "Unable to modify ${imageId} on this account because ${e}"
             redirect(action: 'show', params: params)
         }
-        ['image' : awsEc2Service.getImage(userContext, imageId),
-         'launchPermissions' : launchUsers,
-         'accounts' : grailsApplication.config.grails.awsAccountNames]
+        [
+                image: awsEc2Service.getImage(userContext, imageId),
+                launchPermissions: launchUsers,
+                accounts: grailsApplication.config.grails.awsAccountNames
+        ]
     }
 
-    def update = {
+    def update() {
         def imageId = EntityType.image.ensurePrefix(params.imageId)
         UserContext userContext = UserContext.of(request)
-        List<String> launchPermissions = (params.launchPermissions instanceof String) ? [ params.launchPermissions ] : params.launchPermissions?: []
+        List<String> launchPermissions = Requests.ensureList(params.launchPermissions)
         try {
             awsEc2Service.setImageLaunchers(userContext, imageId, launchPermissions)
             flash.message = "Image '${imageId}' has been updated."
@@ -123,7 +129,7 @@ class ImageController {
         redirect(action: 'show', params: [id: imageId])
     }
 
-    def delete = { ImageDeleteCommand cmd ->
+    def delete(ImageDeleteCommand cmd) {
         if (cmd.hasErrors()) {
             chain(action: 'show', model: [cmd: cmd], params: params) // Use chain to pass both the errors and the params
         } else {
@@ -142,12 +148,10 @@ class ImageController {
         }
     }
 
-    def prelaunch = {
+    def prelaunch() {
         UserContext userContext = UserContext.of(request)
         String imageId = EntityType.image.ensurePrefix(params.id)
-        Image image = awsEc2Service.getImage(userContext, imageId)
-        Collection<InstanceTypeData> instanceTypes =
-                instanceTypeService.findRelevantInstanceTypesForImage(userContext, image)
+        Collection<InstanceTypeData> instanceTypes = instanceTypeService.getInstanceTypes(userContext)
         [
                  'imageId' : imageId,
                  'instanceType' : '',
@@ -158,10 +162,10 @@ class ImageController {
         ]
     }
 
-    def launch = {
+    def launch() {
 
         String message = ''
-        Closure output = {}
+        Closure output = { }
         List<String> instanceIds = []
         List<String> spotInstanceRequestIds = []
 
@@ -175,7 +179,8 @@ class ImageController {
             String zone = params.zone
             String instanceType = params.instanceType
             List<String> rawSecurityGroups = Requests.ensureList(params.selectedGroups)
-            Collection<String> securityGroups = launchTemplateService.includeDefaultSecurityGroups(rawSecurityGroups)
+            Collection<String> securityGroups = launchTemplateService.
+                includeDefaultSecurityGroupsForNonVpc(rawSecurityGroups)
             Integer count = 1
             if (pricing == 'ondemand') {
                 List<Instance> launchedInstances = imageService.runOnDemandInstances(userContext, imageId, count,
@@ -211,9 +216,11 @@ class ImageController {
         }
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 
-    def references = {
+    def references() {
         UserContext userContext = UserContext.of(request)
         String imageId = EntityType.image.ensurePrefix(params.imageId ?: params.id)
         Collection<Instance> instances = awsEc2Service.getInstancesUsingImageId(userContext, imageId)
@@ -225,7 +232,7 @@ class ImageController {
         render result as JSON
     }
 
-    def used = {
+    def used() {
         UserContext userContext = UserContext.of(request)
         Collection<String> imageIdsInUse = imageService.getLocalImageIdsInUse(userContext)
         withFormat {
@@ -241,23 +248,23 @@ class ImageController {
      *         name - the key of the tag to add or replace
      *         value - the value of the tag to add or replace
      */
-    def addTag = {
+    def addTag() {
         String imageId = params.imageId ?: params.id
         Check.notEmpty(imageId, 'imageId')
         performAddTags([imageId])
     }
 
     /**
-     * Adds or replaces a tags on a set of images in batch. Expects the following params:
+     * Adds or replaces a tag on a set of images in batch. Expects the following params:
      *         imageIds - comma separated list of image ids to add or replace tags on
      *         name - the key of the tag to add or replace
      *         value - the value of the tag to add or replace
      */
-    def addTags = {
+    def addTags() {
         performAddTags(params.imageIds?.tokenize(','))
     }
 
-    private def performAddTags(Collection<String> imageIds) {
+    private performAddTags(Collection<String> imageIds) {
         String name = params.name
         String value = params.value
         Check.notEmpty(name, 'name')
@@ -274,7 +281,7 @@ class ImageController {
      *         imageId (in the POST data) or id (on URL) - the id of the image to remove the tag on
      *         name - the key of the tag to remove on the image
      */
-    def removeTag = {
+    def removeTag() {
         String imageId = params.imageId ?: params.id
         Check.notEmpty(imageId, 'imageId')
         performRemoveTags([imageId])
@@ -285,7 +292,7 @@ class ImageController {
      *         imageIds - comma separated list of image ids to remove tags on
      *         name - the key of the tag to remove on the image
      */
-    def removeTags = {
+    def removeTags() {
         performRemoveTags(params.imageIds?.tokenize(','))
     }
 
@@ -299,33 +306,35 @@ class ImageController {
         render "Tag ${name} removed from image${imageIds.size() > 1 ? 's' : ''} ${imageIds.join(', ')}"
     }
 
-    def replicateTags = {
+    def replicateTags() {
         log.info 'image/replicateTags called. Starting unscheduled image tag replication.'
         imageService.replicateImageTags()
         render 'done'
     }
 
-    def massDelete = {
+    def massDelete() {
         UserContext userContext = UserContext.of(request)
         MassDeleteRequest massDeleteRequest = new MassDeleteRequest()
         DataBindingUtils.bindObjectToInstance(massDeleteRequest, params)
         List<Image> deleted = imageService.massDelete(userContext, massDeleteRequest)
 
-        String executeMessage = "Started deleting the following ${deleted.size()} images in ${userContext.region}:\n"
-        String dryRunMessage = "Dry run mode. If executed, this job would delete ${deleted.size()} images in ${userContext.region}:\n"
+        Integer count = deleted.size()
+        String executeMessage = "Started deleting the following ${count} images in ${userContext.region}:\n"
+        Region region = userContext.region
+        String dryRunMessage = "Dry run mode. If executed, this job would delete ${count} images in ${region}:\n"
         String initialMessage = JanitorMode.EXECUTE == massDeleteRequest.mode ? executeMessage : dryRunMessage
         String message = deleted.inject(initialMessage) { message, image -> message + image + '\n' }
         render "<pre>\n${message}</pre>\n"
     }
 
-    def analyze = {
+    def analyze() {
         UserContext userContext = UserContext.of(request)
         Collection<Image> allImages = awsEc2Service.getAccountImages(userContext)
         List<Image> dateless = []
         List<Image> baseless = []
         List<Image> baselessInUse = []
 
-        Set<String> amisInUse = new HashSet<String>()
+        Set<String> amisInUse = [] as Set
         Map<String, List<MergedInstance>> imageIdsToInstanceLists = [:]
         List<MergedInstance> instances = mergedInstanceGroupingService.getMergedInstances(userContext, '')
         instances.each { MergedInstance instance ->
@@ -397,7 +406,7 @@ class ImageController {
         }
     }
 
-    def tagAmiLastReferencedTime = {
+    def tagAmiLastReferencedTime() {
         UserContext userContext = UserContext.of(request)
         String imageTagMasterAccount = grailsApplication.config.cloud.imageTagMasterAccount
         if (grailsApplication.config.cloud.accountName == imageTagMasterAccount) {
@@ -414,12 +423,14 @@ class ImageDeleteCommand {
     AwsAutoScalingService awsAutoScalingService
     AwsEc2Service awsEc2Service
     RestClientService restClientService
+    ConfigService configService
     def grailsApplication
 
     @SuppressWarnings("GroovyAssignabilityCheck")
     static constraints = {
         id(nullable: false, blank: false, size: 12..12, validator: { String value, ImageDeleteCommand command ->
             UserContext userContext = UserContext.of(Requests.request)
+            List<String> promotionTargetServerRootUrls = configService.promotionTargetServerRootUrls
             String promotionTargetServer = command.grailsApplication.config.promote.targetServer
             String env = command.grailsApplication.config.cloud.accountName
 
@@ -431,18 +442,20 @@ class ImageDeleteCommand {
             if (instances || launchConfigurations) {
                 String reason = constructReason(instances, launchConfigurations)
                 return ['image.imageId.used', value, env, reason]
-            } else if (promotionTargetServer) {
+            } else if (promotionTargetServerRootUrls) {
                 // If the AMI is not in use on master server, check promoted data.
-                String url = "${promotionTargetServer}/${userContext.region}/image/references/${value}"
-                JSONElement json = command.restClientService.getAsJson(url)
-                if (json == null) {
-                    return ['image.imageId.prodInaccessible', value, url]
-                }
-                Collection<String> remoteInstances = json.instances
-                Collection<String> remoteLaunchConfigurations = json.launchConfigurations
-                if (remoteInstances || remoteLaunchConfigurations) {
-                    String reason = constructReason(remoteInstances, remoteLaunchConfigurations)
-                    return ['image.imageId.used', value, 'prod', reason]
+                for (String remoteServer in promotionTargetServerRootUrls) {
+                    String url = "${remoteServer}/${userContext.region}/image/references/${value}"
+                    JSONElement json = command.restClientService.getAsJson(url)
+                    if (json == null) {
+                        return ['image.imageId.remoteInaccessible', value, url]
+                    }
+                    Collection<String> remoteInstances = json.instances
+                    Collection<String> remoteLaunchConfigurations = json.launchConfigurations
+                    if (remoteInstances || remoteLaunchConfigurations) {
+                        String reason = constructReason(remoteInstances, remoteLaunchConfigurations)
+                        return ['image.imageId.used', value, remoteServer, reason]
+                    }
                 }
             }
             null

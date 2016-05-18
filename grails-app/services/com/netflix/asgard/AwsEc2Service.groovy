@@ -17,6 +17,7 @@ package com.netflix.asgard
 
 import com.amazonaws.AmazonServiceException
 import com.amazonaws.services.ec2.AmazonEC2
+import com.amazonaws.services.ec2.model.AccountAttribute
 import com.amazonaws.services.ec2.model.Address
 import com.amazonaws.services.ec2.model.AssociateAddressRequest
 import com.amazonaws.services.ec2.model.AttachVolumeRequest
@@ -56,6 +57,7 @@ import com.amazonaws.services.ec2.model.DetachVolumeRequest
 import com.amazonaws.services.ec2.model.Filter
 import com.amazonaws.services.ec2.model.GetConsoleOutputRequest
 import com.amazonaws.services.ec2.model.GetConsoleOutputResult
+import com.amazonaws.services.ec2.model.GroupIdentifier
 import com.amazonaws.services.ec2.model.Image
 import com.amazonaws.services.ec2.model.Instance
 import com.amazonaws.services.ec2.model.InstanceStateChange
@@ -85,13 +87,11 @@ import com.amazonaws.services.ec2.model.Vpc
 import com.google.common.collect.HashMultiset
 import com.google.common.collect.Lists
 import com.google.common.collect.Multiset
-import com.google.common.collect.TreeMultiset
 import com.netflix.asgard.cache.CacheInitializer
-import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.SecurityGroupOption
 import com.netflix.asgard.model.Subnets
 import com.netflix.asgard.model.ZoneAvailability
-import com.netflix.frigga.ami.AppVersion
+import groovyx.gpars.GParsExecutorsPool
 import java.util.regex.Matcher
 import java.util.regex.Pattern
 import org.apache.commons.codec.binary.Base64
@@ -103,6 +103,7 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
     static transactional = false
 
     private static Pattern SECURITY_GROUP_ID_PATTERN = ~/sg-[a-f0-9]+/
+    private static final String IP_PROTOCOL = 'tcp'
 
     MultiRegionAwsClient<AmazonEC2> awsClient
     def awsClientService
@@ -110,6 +111,7 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
     def configService
     def restClientService
     def taskService
+    ThreadScheduler threadScheduler
     List<String> accounts = [] // main account is accounts[0]
 
     /** The state names for instances that count against reservation usage. */
@@ -141,6 +143,18 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         caches.allSubnets.ensureSetUp({ Region region -> retrieveSubnets(region) })
     }
 
+    /**
+     * Gets all available account attributes such as resource limits, default VPC, and supported platforms.
+     *
+     * http://docs.aws.amazon.com/AWSEC2/latest/APIReference/ApiReference-query-DescribeAccountAttributes.html
+     *
+     * @param userContext who, where, why
+     * @return account attributes such as resource limits, default VPC, and supported platforms
+     */
+    List<AccountAttribute> getAccountAttributes(UserContext userContext) {
+        awsClient.by(userContext.region).describeAccountAttributes().accountAttributes
+    }
+
     // Availability Zones
 
     private List<AvailabilityZone> retrieveAvailabilityZones(Region region) {
@@ -168,7 +182,7 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         // Temporary workaround because Amazon can send us the list of images without the tags occasionally.
         // So far it's prevented the image cache from going in a bad state again, but we need a better long term fix.
         if (images && !images.any { it.tags } ) {
-            log.warn "Detected image tags missing for region ${region.code}, attempting to request tags explicitly"
+            log.trace "Detected image tags missing for region ${region.code}, attempting to request tags explicitly"
             Filter hasTagFilter = new Filter('tag-key', ['*']) // This only requests images that have tags
             DescribeImagesRequest hasTagRequest = request.withFilters(hasTagFilter)
             List<Image> imagesWithTags = awsClientForRegion.describeImages(hasTagRequest).getImages()
@@ -197,7 +211,30 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
      * @return a wrapper for querying subnets
      */
     Subnets getSubnets(UserContext userContext) {
-        Subnets.from(caches.allSubnets.by(userContext.region).list())
+        Subnets.from(caches.allSubnets.by(userContext.region).list(), getDefaultVpcId(userContext))
+    }
+
+    /**
+     * Gets all the subnet ID strings for the subnets in the default VPC of the current account-region. If the
+     * account-region predates VPC then it will not have a default VPC, in which case this method will return an empty
+     * list. It is not possible to have a default VPC with zero subnets.
+     *
+     * @param userContext who, where, why
+     * @return list of identifiers for subnets in default VPC, or empty list if no default VPC exists
+     */
+    List<String> getDefaultVpcSubnetIds(UserContext userContext) {
+        String defaultVpcId = getDefaultVpcId(userContext)
+        defaultVpcId ? getSubnets(userContext).findSubnetsByVpc(defaultVpcId).subnetIds : []
+    }
+
+    /**
+     * Gets the default VPC ID if available.
+     *
+     * @param userContext who, where, why
+     * @return the identifier of the default VPC, if available, or null if there is no default VPC
+     */
+    String getDefaultVpcId(UserContext userContext) {
+        getVpcs(userContext).find { it.isDefault }?.vpcId
     }
 
     private Collection<Vpc> retrieveVpcs(Region region) {
@@ -272,7 +309,7 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
 
     Map<String, Image> mapImageIdsToImagesForMergedInstances(UserContext userContext,
                                                              Collection<MergedInstance> mergedInstances) {
-        Map<String, Image> imageIdsToImages = new HashMap<String, Image>()
+        Map<String, Image> imageIdsToImages = [:]
         for (MergedInstance mergedInstance : mergedInstances) {
             String imageId = mergedInstance?.amiId
             if (!(imageId in imageIdsToImages.keySet())) {
@@ -354,7 +391,7 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         try {
             List<String> hasAccounts = getImageLaunchers(userContext, imageId)
             hasAccounts += configService.awsAccountNumber
-            List<String> addAccounts = configService.awsAccounts.findAll {account -> !hasAccounts.any {it == account}}
+            List<String> addAccounts = configService.awsAccounts.findAll { acct -> !hasAccounts.any { it == acct } }
             if (addAccounts.size() > 0) {
                 addImageLaunchers(userContext, imageId, addAccounts, existingTask)
             }
@@ -411,43 +448,62 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         getSecurityGroups(userContext).findAll { it.groupName ==~ pat }
     }
 
+    /**
+     * Looks up security groups by a set of group names or IDs and returns a collection of unique compound identifier
+     * objects containing the group name and group ID of each matching security group.
+     *
+     * @param userContext who, where, why
+     * @param namesOrIds the group names or IDs of the security groups to find
+     * @return the GroupIdentifier objects matching the requested names or IDs
+     */
+    List<GroupIdentifier> getSecurityGroupNameIdPairsByNamesOrIds(UserContext userContext,
+                                                                        Collection<String> namesOrIds) {
+        Collection<SecurityGroup> all = getSecurityGroups(userContext)
+        List<SecurityGroup> securityGroups = all.findAll { it.groupId in namesOrIds || it.groupName in namesOrIds }
+        List<GroupIdentifier> matches = securityGroups.collect {
+            new GroupIdentifier(groupName: it.groupName, groupId: it.groupId)
+        }
+        matches.unique().sort { it.groupName }
+    }
+
     SecurityGroup getSecurityGroup(UserContext userContext, String name, From from = From.AWS) {
         Region region = userContext.region
         Check.notNull(name, SecurityGroup, "name")
         String groupName
         DescribeSecurityGroupsRequest request = new DescribeSecurityGroupsRequest()
         String groupId = ''
+        SecurityGroup cachedSecGroup = null
         if (name ==~ SECURITY_GROUP_ID_PATTERN) {
             groupId = name
             request.withGroupIds(groupId)
-            SecurityGroup cachedSecurityGroup = caches.allSecurityGroups.by(region).list().find { it.groupId == groupId }
-            groupName = cachedSecurityGroup?.groupName
+            cachedSecGroup = caches.allSecurityGroups.by(region).get(groupId)
         } else {
-            request.withGroupNames(name)
             groupName = name
+            request.withGroupNames(name)
+            cachedSecGroup = caches.allSecurityGroups.by(region).list().find { it.groupName == groupName }
+            groupId = cachedSecGroup?.groupId
         }
         if (from == From.CACHE) {
-            return caches.allSecurityGroups.by(region).get(groupName)
+            return cachedSecGroup
         }
         SecurityGroup group = null
         try {
             DescribeSecurityGroupsResult result = awsClient.by(region).describeSecurityGroups(request)
-            group = Check.lone(result?.getSecurityGroups(), SecurityGroup)
-            groupName = group?.groupName
+            group = Check.loneOrNone(result.getSecurityGroups(), SecurityGroup)
         } catch (AmazonServiceException e) {
-            // Can't find a security group with that request.
-            if (e.errorCode == 'InvalidParameterValue' && !groupId) {
+            // Can't find a security group by name.
+            if (e.errorCode == 'InvalidParameterValue') {
                 // It's likely a VPC security group which we can't reference by name. Maybe it has an ID in the cache.
-                SecurityGroup cachedGroup = caches.allSecurityGroups.by(region).get(groupName)
-                if (cachedGroup) {
-                    request = new DescribeSecurityGroupsRequest(groupIds: [cachedGroup.groupId])
+                if (cachedSecGroup) {
+                    request = new DescribeSecurityGroupsRequest(groupIds: [cachedSecGroup.groupId])
                     DescribeSecurityGroupsResult result = awsClient.by(region).describeSecurityGroups(request)
                     group = Check.lone(result?.getSecurityGroups(), SecurityGroup)
                 }
             }
         }
-        if (groupName) {
-            return caches.allSecurityGroups.by(region).put(groupName, group)
+        groupId ?: group?.groupId
+        if (groupId) {
+            return caches.allSecurityGroups.by(region).put(groupId, group)
         }
         null
     }
@@ -516,35 +572,74 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         taskService.runTask(userContext, "Remove Security Group ${name}", { task ->
             awsClient.by(userContext.region).deleteSecurityGroup(new DeleteSecurityGroupRequest(groupId: id))
         }, Link.to(EntityType.security, name))
-        caches.allSecurityGroups.by(userContext.region).remove(name)
+        caches.allSecurityGroups.by(userContext.region).remove(id)
     }
 
-    /** High-level permission update for a group pair: given the desired state, make it so. */
+    /**
+     * High-level permission update for a group pair: given the desired state, make it so. Ensure that all the requested
+     * permissions are authorized for the source to call the target, and ensure that all other permissions from the
+     * source to the target are revoked.
+     *
+     * @param userContext who, where, why
+     * @param targetGroup the security group of the instances that will be allowed to receive traffic
+     * @param sourceGroup the security group of the instances that will be allowed to send traffic
+     * @param desired the IP permissions that should be entirely and solely in effect when this method completes
+     */
     void updateSecurityGroupPermissions(UserContext userContext, SecurityGroup targetGroup, SecurityGroup sourceGroup,
-            List<IpPermission> wantPerms) {
-        List<IpPermission> havePerms = getIngressFrom(targetGroup, sourceGroup)
-        if (!havePerms && !wantPerms) {
+            List<IpPermission> desired) {
+        List<IpPermission> current = getIngressFrom(targetGroup, sourceGroup)
+        if (!current && !desired) {
             return
         }
-        Boolean somethingChanged = false
-        havePerms.each { havePerm ->
-            if (!wantPerms.any { wp -> wp.fromPort == havePerm.fromPort && wp.toPort == havePerm.toPort } ) {
-                revokeSecurityGroupIngress(userContext, targetGroup, sourceGroup, 'tcp',
-                        havePerm.fromPort, havePerm.toPort)
-                somethingChanged = true
+        String sourceName = sourceGroup.groupName
+        String targetName = targetGroup.groupName
+        String targetGroupId = targetGroup.groupId
+        String userId = configService.awsAccountNumber
+        UserIdGroupPair srcGroupId = new UserIdGroupPair(userId: userId, groupId: sourceGroup.groupId)
+        List<IpPermission> toRevoke = determinePermissionsToChange(current, desired, srcGroupId)
+        List<IpPermission> toAuthorize = determinePermissionsToChange(desired, current, srcGroupId)
+        if (toRevoke || toAuthorize) {
+            String msg = "Update Security Group Ingress between source '${sourceName}' and target '${targetName}'"
+            taskService.runTask(userContext, msg, { Task task ->
+                authorizePermissions(userContext, sourceGroup, targetGroup, toAuthorize, task)
+                revokePermissions(userContext, sourceGroup, targetGroup, toRevoke, task)
+                getSecurityGroup(userContext, targetGroupId)
+            }, Link.to(EntityType.security, targetGroupId))
+        }
+    }
+
+    /**
+     * For a set of IP permissions for traffic from instances in a single specified security group, this method
+     * determines the IP permissions that need to change based on which port ranges are currently in place and which
+     * port ranges are desired.<p>
+     *
+     * If the first set of IP permissions is the current set, and the second set is the desired set, then this method
+     * returns the IP permissions that need to be revoked. Conversely, if the first set if the desired set and the
+     * second set is the current, then this method returns the IP permissions that need to be authorized.
+     *
+     * @param thesePermissions the current permissions (to determine what to revoke) or the desired permissions (to
+     *          determine what to authorize)
+     * @param otherPermissions the desired permissions (to determine what to revoke) or the current permissions (to
+     *          determine what to authorize)
+     * @param userIdGroupPair an AWS account number, and the id of a security group within that account, together
+     *          signifying the coordinates of a globally unique security group, which is the security group of the
+     *          instances that will be sending traffic
+     * @return the permissions to authorize (if called with current permissions first) or the permissions to revoke
+     *          (if called with desired permissions first)
+     */
+    private List<IpPermission> determinePermissionsToChange(List<IpPermission> thesePermissions,
+            List<IpPermission> otherPermissions, UserIdGroupPair userIdGroupPair) {
+
+        List<IpPermission> permissionsToChange = []
+        for (IpPermission permission in thesePermissions) {
+            int fromPort = permission.fromPort
+            int toPort = permission.toPort
+            if (!otherPermissions.any { otherPerm -> otherPerm.fromPort == fromPort && otherPerm.toPort == toPort }) {
+                permissionsToChange << new IpPermission(userIdGroupPairs: [userIdGroupPair], ipProtocol: IP_PROTOCOL,
+                        fromPort: fromPort, toPort: toPort)
             }
         }
-        wantPerms.each { wantPerm ->
-            if (!havePerms.any { hp -> hp.fromPort == wantPerm.fromPort && hp.toPort == wantPerm.toPort} ) {
-                authorizeSecurityGroupIngress(userContext, targetGroup, sourceGroup, 'tcp',
-                        wantPerm.fromPort, wantPerm.toPort)
-                somethingChanged = true
-            }
-        }
-        // This method gets called hundreds of times for one user request so don't call Amazon unless necessary.
-        if (somethingChanged) {
-            getSecurityGroup(userContext, targetGroup.groupId)
-        }
+        permissionsToChange
     }
 
     /** Converts a list of IpPermissions into a string representation, or null if none. */
@@ -559,18 +654,53 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         }
     }
 
-    /** Returns the canonical string representation of a from-to port pair. */
+    private void authorizePermissions(UserContext userContext, SecurityGroup source, SecurityGroup target,
+                                      List<IpPermission> permissionsToAuth, Task task) {
+        if (permissionsToAuth) {
+            String ports = permissionsToString(permissionsToAuth)
+            task.log("Authorize Security Group Ingress from '${source.groupName}' to '${target.groupName}' on ${ports}")
+            AuthorizeSecurityGroupIngressRequest request = new AuthorizeSecurityGroupIngressRequest()
+            request.withGroupId(target.groupId).withIpPermissions(permissionsToAuth)
+            awsClient.by(userContext.region).authorizeSecurityGroupIngress(request)
+        }
+    }
+
+    private void revokePermissions(UserContext userContext, SecurityGroup source, SecurityGroup target,
+                                   List<IpPermission> permissionsToRevoke, Task task) {
+        if (permissionsToRevoke) {
+            String ports = permissionsToString(permissionsToRevoke)
+            task.log("Revoke Security Group Ingress from '${source.groupName}' to '${target.groupName}' on ${ports}")
+            RevokeSecurityGroupIngressRequest request = new RevokeSecurityGroupIngressRequest()
+            request.withGroupId(target.groupId).withIpPermissions(permissionsToRevoke)
+            awsClient.by(userContext.region).revokeSecurityGroupIngress(request)
+        }
+    }
+
+    /**
+     * Returns the canonical string representation of a from-to port pair. If the two numbers are the same, this method
+     * returns the number as string. Otherwise, this method returns a string with the fromPort separated from the toPort
+     * by a hyphen like "7101-7102".
+     *
+     * @param fromPort the low end of a port range
+     * @param toPort the high end of a port range
+     * @return string representation of the port range
+     */
     public static String portString(int fromPort, int toPort) {
         toPort == fromPort ? "${fromPort}" : "${fromPort}-${toPort}"
     }
 
-    /** Converts a string ports representation into a list of partially populated IpPermission instances. */
+    /**
+     * Converts a string ports representation into a list of partially populated IpPermission instances.
+     *
+     * @param portsStr the string representation of a set of comma-separated port ranges, such as "7001,7101-7102"
+     * @return the IpPermission objects populated only with fromPort and toPort integer values
+     */
     static List<IpPermission> permissionsFromString(String portsStr) {
         List<IpPermission> perms = []
         if (portsStr) {
             portsStr.split(',').each { rangeStr ->
                 Matcher m = rangeStr =~ /(-?\d+)(-(-?\d+))?/
-                //println "permissionsFromString: ${portStr} => ${m[0]}"
+                log.debug "permissionsFromString: ${portsStr} => ${m[0]}"
                 if (m.matches()) {
                     def rangeParts = m[0]  // 0:all 1:from 2:dashAndTo 3:to
                     String fromPort = rangeParts[1]
@@ -592,7 +722,7 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
     private String bestIngressPortsFor(SecurityGroup targetGroup) {
         Map guess = ['7001' : 1]
         targetGroup.ipPermissions.each {
-            if (it.ipProtocol == 'tcp' &&  it.userIdGroupPairs.size() > 0) {
+            if (it.ipProtocol == IP_PROTOCOL &&  it.userIdGroupPairs.size() > 0) {
                 Integer count = it.userIdGroupPairs.size()
                 String portRange = portString(it.fromPort, it.toPort)
                 guess[portRange] = guess[portRange] ? guess[portRange] + count : count
@@ -601,38 +731,6 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         String g = guess.sort { -it.value }.collect { it.key }[0]
         //println "guess: ${target.groupName} ${guess} => ${g}"
         g
-    }
-
-    // TODO refactor the following two methods to take IpPermissions List from callers now that AWS API takes those.
-
-    private void authorizeSecurityGroupIngress(UserContext userContext, SecurityGroup targetgroup, SecurityGroup sourceGroup, String ipProtocol, int fromPort, int toPort) {
-        String groupName = targetgroup.groupName
-        String sourceGroupName = sourceGroup.groupName
-        UserIdGroupPair sourcePair = new UserIdGroupPair().withUserId(accounts[0]).withGroupId(sourceGroup.groupId)
-        List<IpPermission> perms = [
-                new IpPermission()
-                        .withUserIdGroupPairs(sourcePair)
-                        .withIpProtocol(ipProtocol).withFromPort(fromPort).withToPort(toPort)
-        ]
-        taskService.runTask(userContext, "Authorize Security Group Ingress to ${groupName} from ${sourceGroupName} on ${fromPort}-${toPort}", { task ->
-            awsClient.by(userContext.region).authorizeSecurityGroupIngress(
-                    new AuthorizeSecurityGroupIngressRequest().withGroupId(targetgroup.groupId).withIpPermissions(perms))
-        }, Link.to(EntityType.security, groupName))
-    }
-
-    private void revokeSecurityGroupIngress(UserContext userContext, SecurityGroup targetgroup, SecurityGroup sourceGroup, String ipProtocol, int fromPort, int toPort) {
-        String groupName = targetgroup.groupName
-        String sourceGroupName = sourceGroup.groupName
-        UserIdGroupPair sourcePair = new UserIdGroupPair().withUserId(accounts[0]).withGroupId(sourceGroup.groupId)
-        List<IpPermission> perms = [
-                new IpPermission()
-                        .withUserIdGroupPairs(sourcePair)
-                        .withIpProtocol(ipProtocol).withFromPort(fromPort).withToPort(toPort)
-        ]
-        taskService.runTask(userContext, "Revoke Security Group Ingress to ${groupName} from ${sourceGroupName} on ${fromPort}-${toPort}", { task ->
-            awsClient.by(userContext.region).revokeSecurityGroupIngress(
-                    new RevokeSecurityGroupIngressRequest().withGroupId(targetgroup.groupId).withIpPermissions(perms))
-        }, Link.to(EntityType.security, groupName))
     }
 
     // TODO: Delete this method after rewriting AwsResultsRetrieverSpec unit test to use some other use case
@@ -718,6 +816,21 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         getInstances(userContext).findAll { Instance instance -> instance.imageId == imageId }
     }
 
+    /**
+     * Finds all the instances that were launched with the specified security group.
+     *
+     * @param userContext who, where, why
+     * @param securityGroup the security group for which to find relevant instances
+     * @return all the instances associated with the specified security group
+     */
+    Collection<Instance> getInstancesWithSecurityGroup(UserContext userContext, SecurityGroup securityGroup) {
+        getInstances(userContext).findAll {
+            String name = securityGroup.groupName
+            String id = securityGroup.groupId
+            (name && (name in it.securityGroups*.groupName)) || (id && (id in it.securityGroups*.groupId))
+        }
+    }
+
     Instance getInstance(UserContext userContext, String instanceId, From from = From.AWS) {
         if (from == From.CACHE) {
             return caches.allInstances.by(userContext.region).get(instanceId)
@@ -726,27 +839,12 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         instances ? instances[0] : null
     }
 
-    Multiset<AppVersion> getCountedAppVersions(UserContext userContext) {
-        getCountedAppVersions(getInstances(userContext), caches.allImages.by(userContext.region).unmodifiable())
-    }
-
-    private Multiset<AppVersion> getCountedAppVersions(Collection<Instance> instances, Map<String, Image> images) {
-        Multiset<AppVersion> appVersions = TreeMultiset.create()
-        instances.each { Instance instance ->
-            Image image = images.get(instance.imageId)
-            AppVersion appVersion = image?.parsedAppVersion
-            if (appVersion) {
-                appVersions.add(appVersion)
-            }
-        }
-        appVersions
-    }
-
     Reservation getInstanceReservation(UserContext userContext, String instanceId) {
-        Check.notNull(instanceId, Reservation, "instanceId")
+        if (!instanceId) { return null }
         def result
         try {
-            result = awsClient.by(userContext.region).describeInstances(new DescribeInstancesRequest().withInstanceIds(instanceId))
+            DescribeInstancesRequest request = new DescribeInstancesRequest(instanceIds: [instanceId])
+            result = awsClient.by(userContext.region).describeInstances(request)
         }
         catch (AmazonServiceException ase) {
             log.info "Request for instance ${instanceId} failed because ${ase}"
@@ -797,30 +895,25 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
         userData ? new String(Base64.decodeBase64(userData.bytes)) : null
     }
 
-    Integer getRepeatedResponseCode(String url) {
-        Integer responseCode = restClientService.getResponseCode(url)
-        if (checkOkayResponseCode(responseCode)) {
-            return responseCode
-        }
-        // First try failed but that might have been a network fluke.
-        // If the next two staggered attempts pass, then assume the host is healthy.
-        Time.sleepCancellably 2000
-        responseCode = restClientService.getResponseCode(url)
-        if (checkOkayResponseCode(responseCode)) {
-            // First try failed, second try passed. Use the tie-breaker as the final answer.
-            Time.sleepCancellably 2000
-            return restClientService.getResponseCode(url)
-        }
-        // First two tries both failed. Give up and return the latest failure code.
-        return responseCode
-    }
-
     Boolean checkHostHealth(String url) {
-        checkOkayResponseCode(getRepeatedResponseCode(url))
+        if (configService.isOnline()) {
+            Integer responseCode = restClientService.getRepeatedResponseCode(url)
+            return restClientService.checkOkayResponseCode(responseCode)
+        }
+        true
     }
 
-    private Boolean checkOkayResponseCode(Integer responseCode) {
-        responseCode == 200
+    /**
+     * Test health of instances in parallel. One failing health check stops all checks and returns false.
+     *
+     * @param healthCheckUrls of instances
+     * @return indicates if all instances are healthy
+     */
+    Boolean checkHostsHealth(Collection<String> healthCheckUrls) {
+        GParsExecutorsPool.withExistingPool(threadScheduler.scheduler) {
+            String unhealthyHostUrl = healthCheckUrls.findAnyParallel { !checkHostHealth(it) }
+            !unhealthyHostUrl
+        }
     }
 
     List<InstanceStateChange> terminateInstances(UserContext userContext, Collection<String> instanceIds,
@@ -850,7 +943,8 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
     String getConsoleOutput(UserContext userContext, String instanceId) {
         GetConsoleOutputResult result = awsClient.by(userContext.region).getConsoleOutput(
                 new GetConsoleOutputRequest().withInstanceId(instanceId))
-        new String(Base64.decodeBase64(result.getOutput().bytes))
+        String output = result.getOutput()
+        output ? new String(Base64.decodeBase64(output.bytes)) : null
     }
 
     // Elastic IPs
@@ -863,7 +957,8 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
 
     void associateAddress(UserContext userContext, String publicIp, String instanceId) {
         taskService.runTask(userContext, "Associate ${publicIp} with ${instanceId}", { task ->
-            awsClient.by(userContext.region).associateAddress(new AssociateAddressRequest().withPublicIp(publicIp).withInstanceId(instanceId))
+            AssociateAddressRequest request = new AssociateAddressRequest(publicIp: publicIp, instanceId: instanceId)
+            awsClient.by(userContext.region).associateAddress(request)
         }, Link.to(EntityType.instance, instanceId))
     }
 
@@ -886,7 +981,9 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
      *          are no reservations in any zones for the specified instance type
      */
     List<ZoneAvailability> getZoneAvailabilities(UserContext userContext, String instanceType) {
-        Collection<ReservedInstances> reservedInstanceGroups = getReservedInstances(userContext)
+        Collection<ReservedInstances> reservedInstanceGroups =
+                filterReservedInstancesByOffering(getReservedInstances(userContext),
+                        configService.getReservationOfferingTypeFilters())
         Map<String, Integer> zonesToActiveReservationCounts = [:]
         for (ReservedInstances reservedInstanceGroup in reservedInstanceGroups) {
             if (reservedInstanceGroup.state == 'active' && reservedInstanceGroup.instanceType == instanceType) {
@@ -911,6 +1008,17 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
             new ZoneAvailability(zoneName: zone, totalReservations: reservationCount, usedReservations: instanceCount)
         }
         zoneAvailabilities.any { it.totalReservations } ? zoneAvailabilities : []
+    }
+
+    /**
+     * @param instances Collection of ReservedInstances
+     * @param filters as List of Strings
+     * @return Collection of ReservedInstances that are filtered by @param filters
+     */
+    Collection<ReservedInstances> filterReservedInstancesByOffering(Collection<ReservedInstances> instances,
+                                                                    List<String> filters){
+        instances.removeAll { it.offeringType in filters }
+        instances
     }
 
     Collection<ReservedInstances> getReservedInstances(UserContext userContext) {
@@ -1061,10 +1169,11 @@ class AwsEc2Service implements CacheInitializer, InitializingBean {
      * @return preselected zone names
      */
     Collection<String> preselectedZoneNames(Collection<AvailabilityZone> availabilityZones,
-            Collection<String> selectedZoneNames, AutoScalingGroupData group = null) {
+            Collection<String> selectedZoneNames, def group = null) {
         Collection<AvailabilityZone> preselectedAvailabilityZones = availabilityZones.findAll {
             it.shouldBePreselected(selectedZoneNames, group)
         }
         preselectedAvailabilityZones*.zoneName
     }
 }
+

@@ -17,22 +17,19 @@ package com.netflix.asgard
 
 import com.amazonaws.services.autoscaling.model.AutoScalingGroup
 import com.amazonaws.services.autoscaling.model.Instance
-import com.netflix.asgard.mock.Mocks
 
 class AutoScalingGroupTests extends GroovyTestCase {
 
     void testCopy() {
 
-        Mocks.createDynamicMethods() 
-
-        Mocks.awsAutoScalingService()
+        new MonkeyPatcherService().createDynamicMethods()
 
         Date start = new Date()
         Collection<Instance> instances = [new Instance().withInstanceId("id-blahblah")]
         AutoScalingGroup original = new AutoScalingGroup().withAutoScalingGroupName("name")
-                .withAvailabilityZones(["one", "two"]).withDefaultCooldown(10).withDesiredCapacity(2).withCreatedTime(start)
-                .withMaxSize(4).withMinSize(4).withLoadBalancerNames([]).withLaunchConfigurationName("lcname")
-                .withInstances(instances)
+                .withAvailabilityZones(["one", "two"]).withDefaultCooldown(10).withDesiredCapacity(2)
+                .withCreatedTime(start).withMaxSize(4).withMinSize(4).withLoadBalancerNames([])
+                .withLaunchConfigurationName("lcname").withInstances(instances)
         AutoScalingGroup copy = original.copy()
 
         assert !copy.is(original)

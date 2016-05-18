@@ -20,9 +20,10 @@ import com.amazonaws.services.autoscaling.model.LaunchConfiguration
 import com.amazonaws.services.autoscaling.model.ScheduledUpdateGroupAction
 import com.amazonaws.services.ec2.model.AvailabilityZone
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
+import com.google.common.annotations.VisibleForTesting
 import com.netflix.asgard.model.AutoScalingGroupData
 import com.netflix.asgard.model.AutoScalingProcessType
-import com.netflix.asgard.model.GroupedInstance
+import com.netflix.asgard.model.Deployment
 import com.netflix.asgard.model.InstancePriceType
 import com.netflix.asgard.model.ScalingPolicyData
 import com.netflix.asgard.model.SubnetTarget
@@ -38,26 +39,31 @@ import com.netflix.asgard.push.InitialTraffic
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
+import groovy.transform.PackageScope
 
 @ContextParam('region')
 class ClusterController {
 
-    def static allowedMethods = [createNextGroup: 'POST', resize: 'POST', delete: 'POST', activate: 'POST',
+    static allowedMethods = [createNextGroup: 'POST', resize: 'POST', delete: 'POST', activate: 'POST',
             deactivate: 'POST']
 
     def grailsApplication
+    def applicationService
     def awsAutoScalingService
     def awsEc2Service
     def awsLoadBalancerService
     def configService
+    def deploymentService
     def mergedInstanceService
     def pushService
     def spotInstanceRequestService
     def taskService
 
-    def index = { redirect(action: 'list', params: params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         Collection<Cluster> clusterObjects = awsAutoScalingService.getClusters(userContext)
         Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
@@ -66,7 +72,7 @@ class ClusterController {
                 appNames.contains(Relationships.appNameFromGroupName(cluster.name))
             }
         }
-        clusterObjects = clusterObjects.sort{ it.name.toLowerCase() }
+        clusterObjects = clusterObjects.sort { it.name.toLowerCase() }
         withFormat {
             html { [clusters: clusterObjects, appNames: appNames] }
             xml {
@@ -97,7 +103,7 @@ class ClusterController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String name = params.id ?: params.name
         Cluster cluster = awsAutoScalingService.getCluster(userContext, name)
@@ -108,8 +114,9 @@ class ClusterController {
                 html {
                     AutoScalingGroupData lastGroup = cluster.last()
                     String nextGroupName = Relationships.buildNextAutoScalingGroupName(lastGroup.autoScalingGroupName)
-                    Boolean okayToCreateGroup = cluster.size() < Relationships.CLUSTER_MAX_GROUPS
-                    String recommendedNextStep = cluster.size() >= Relationships.CLUSTER_MAX_GROUPS ?
+                    int clusterMaxGroups = configService.clusterMaxGroups
+                    Boolean okayToCreateGroup = cluster.size() < clusterMaxGroups
+                    String recommendedNextStep = cluster.size() >= clusterMaxGroups ?
                         'Delete an old group before pushing to a new group.' :
                         cluster.size() <= 1 ? 'Create a new group and switch traffic to it' :
                         'Switch traffic to the preferred group, then delete legacy group'
@@ -118,19 +125,26 @@ class ClusterController {
 
                     boolean showAllImages = params.allImages ? true : false
                     Map attributes = pushService.prepareEdit(userContext, lastGroup.autoScalingGroupName, showAllImages,
-                            actionName, Requests.ensureList(params.selectedSecurityGroups))
+                            Requests.ensureList(params.selectedSecurityGroups))
                     Collection<AvailabilityZone> availabilityZones = awsEc2Service.getAvailabilityZones(userContext)
                     Collection<String> selectedZones = awsEc2Service.preselectedZoneNames(availabilityZones,
                             Requests.ensureList(params.selectedZones), lastGroup)
-                    Subnets subnets = awsEc2Service.getSubnets(userContext)
                     List<LoadBalancerDescription> loadBalancers = awsLoadBalancerService.getLoadBalancers(userContext).
                             sort { it.loadBalancerName.toLowerCase() }
-                    List<String> selectedLoadBalancers = Requests.ensureList(params.selectedLoadBalancers) ?: lastGroup
-                            .loadBalancerNames
+                    Subnets subnets = awsEc2Service.getSubnets(userContext)
                     List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(lastGroup.vpcZoneIdentifier)
                     String subnetPurpose = subnets.coerceLoneOrNoneFromIds(subnetIds)?.purpose
+                    String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
+                    List<String> selectedLoadBalancers = Requests.ensureList(
+                            params["selectedLoadBalancersForVpcId${vpcId}"]) ?: lastGroup.loadBalancerNames
+                    log.debug """ClusterController.show for Cluster '${cluster.name}' Load Balancers from last Group: \
+${lastGroup.loadBalancerNames}"""
                     List<String> subnetPurposes = subnets.getPurposesForZones(availabilityZones*.zoneName,
                             SubnetTarget.EC2).sort()
+                    Map<String, Collection<String>> zonesByPurpose = subnets.groupZonesByPurpose(
+                            availabilityZones*.zoneName, SubnetTarget.EC2)
+                    Deployment deployment = deploymentService.getRunningDeploymentForCluster(userContext.region,
+                            cluster.name)
                     attributes.putAll([
                             cluster: cluster,
                             runningTasks: runningTasks,
@@ -138,14 +152,17 @@ class ClusterController {
                             nextGroupName: nextGroupName,
                             okayToCreateGroup: okayToCreateGroup,
                             recommendedNextStep: recommendedNextStep,
-                            buildServer: grailsApplication.config.cloud.buildServer,
+                            buildServer: configService.buildServerUrl,
                             vpcZoneIdentifier: lastGroup.vpcZoneIdentifier,
-                            zonesGroupedByPurpose: subnets.groupZonesByPurpose(availabilityZones*.zoneName, SubnetTarget.EC2),
+                            zonesGroupedByPurpose: zonesByPurpose,
                             selectedZones: selectedZones,
                             subnetPurposes: subnetPurposes,
                             subnetPurpose: subnetPurpose ?: null,
                             loadBalancersGroupedByVpcId: loadBalancers.groupBy { it.VPCId },
                             selectedLoadBalancers: selectedLoadBalancers,
+                            spotUrl: configService.spotUrl,
+                            pricing: params.pricing ?: attributes.pricing,
+                            deployment: deployment
                     ])
                     attributes
                 }
@@ -158,7 +175,7 @@ class ClusterController {
         }
     }
 
-    def showLastGroup = {
+    def showLastGroup() {
         UserContext userContext = UserContext.of(request)
         String name = params.id ?: params.name
         Cluster cluster = awsAutoScalingService.getCluster(userContext, name)
@@ -169,9 +186,12 @@ class ClusterController {
         }
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 
-    def createNextGroup = {
+    @SuppressWarnings("GroovyAssignabilityCheck")
+    def createNextGroup() {
         UserContext userContext = UserContext.of(request)
         String name = params.name
         Cluster cluster = awsAutoScalingService.getCluster(userContext, name)
@@ -182,7 +202,7 @@ class ClusterController {
             return
         }
 
-        Boolean okayToCreateGroup = cluster.size() < Relationships.CLUSTER_MAX_GROUPS
+        Boolean okayToCreateGroup = cluster.size() < configService.clusterMaxGroups
         if (okayToCreateGroup) {
             AutoScalingGroupData lastGroup = cluster.last()
             String lcName = lastGroup.launchConfigurationName
@@ -190,33 +210,23 @@ class ClusterController {
             String appName = Relationships.appNameFromGroupName(name)
             List<String> securityGroups = Requests.ensureList(params.selectedSecurityGroups)
             List<String> termPolicies = Requests.ensureList(params.terminationPolicy)
-            List<String> loadBalancerNames = Requests.ensureList(params.selectedLoadBalancers)
+            Subnets subnets = awsEc2Service.getSubnets(userContext)
+            String subnetPurpose = params.subnetPurpose
+            String vpcId = subnets.getVpcIdForSubnetPurpose(subnetPurpose) ?: ''
+            List<String> loadBalancerNames = Requests.ensureList(params["selectedLoadBalancersForVpcId${vpcId}"] ?:
+                    params["selectedLoadBalancers"])
             // Availability zones default to the last group's value since this field is required.
             List<String> selectedZones = Requests.ensureList(params.selectedZones) ?: lastGroup.availabilityZones
             String azRebalance = params.azRebalance
             boolean lastRebalanceSuspended = lastGroup.isProcessSuspended(AutoScalingProcessType.AZRebalance)
-            boolean azRebalanceSuspended = (azRebalance == null) ? lastRebalanceSuspended : (azRebalance == 'disabled')
-            String minSizeParam = params.min
-            Integer minSize = minSizeParam ? minSizeParam as Integer : lastGroup.minSize
-            String desiredCapacityParam = params.desiredCapacity
-            Integer desiredCapacity = desiredCapacityParam ? desiredCapacityParam as Integer : lastGroup.desiredCapacity
-            String maxSizeParam = params.max
-            Integer maxSize = maxSizeParam ? maxSizeParam as Integer : lastGroup.maxSize
+            boolean azRebalanceSuspended = shouldAzRebalanceBeSuspended(azRebalance, lastRebalanceSuspended)
+            Integer minSize = convertToIntOrUseDefault(params.min, lastGroup.minSize)
+            Integer desiredCapacity = convertToIntOrUseDefault(params.desiredCapacity, lastGroup.desiredCapacity)
+            Integer maxSize = convertToIntOrUseDefault(params.max, lastGroup.maxSize)
             InitialTraffic initialTraffic = params.trafficAllowed ? InitialTraffic.ALLOWED : InitialTraffic.PREVENTED
             boolean checkHealth = params.containsKey('checkHealth')
-            boolean discoveryExists = configService.doesRegionalDiscoveryExist(userContext.region)
-            if (discoveryExists && initialTraffic == InitialTraffic.PREVENTED && !checkHealth) {
-                flash.message = "Due to a Eureka limitation, you must enable traffic and/or wait for health checks"
-                redirect(action: 'show', params: [id: name])
-                return
-            }
             String instanceType = params.instanceType ?: lastLaunchConfig.instanceType
-            String spotPrice = null
-            if (!params.pricing) {
-                spotPrice = lastLaunchConfig.spotPrice
-            } else if (params.pricing == InstancePriceType.SPOT.name()) {
-                spotPrice = spotInstanceRequestService.recommendSpotPrice(userContext, instanceType)
-            }
+            String spotPrice = determineSpotPrice(lastLaunchConfig, userContext, instanceType)
 
             final String nextGroupName = Relationships.buildNextAutoScalingGroupName(lastGroup.autoScalingGroupName)
             List<ScalingPolicyData> lastScalingPolicies = awsAutoScalingService.getScalingPolicyDatas(userContext,
@@ -227,55 +237,51 @@ class ClusterController {
 
             List<ScheduledUpdateGroupAction> lastScheduledActions = awsAutoScalingService.getScheduledActionsForGroup(
                     userContext, lastGroup.autoScalingGroupName)
-            List<String> ignoredScheduledActionProperties = ['startTime', 'time', 'autoScalingGroupName',
-                    'scheduledActionName', 'scheduledActionARN']
-            List<ScheduledUpdateGroupAction> newScheduledActions = lastScheduledActions.collect {
-                ScheduledUpdateGroupAction newScheduledAction = BeanState.ofSourceBean(it).
-                        ignoreProperties(ignoredScheduledActionProperties).injectState(new ScheduledUpdateGroupAction())
-                String id = awsAutoScalingService.nextPolicyId(userContext)
-                newScheduledAction.with {
-                    autoScalingGroupName = nextGroupName
-                    scheduledActionName = Relationships.buildScalingPolicyName(nextGroupName, id)
-                }
-                newScheduledAction
-            }
+            List<ScheduledUpdateGroupAction> newScheduledActions = awsAutoScalingService.copyScheduledActionsForNewAsg(
+                    userContext, nextGroupName, lastScheduledActions)
 
             Integer lastGracePeriod = lastGroup.healthCheckGracePeriod
-            Subnets subnets = awsEc2Service.getSubnets(userContext)
-            String subnetPurpose = params.subnetPurpose
             String vpcZoneIdentifier = subnets.constructNewVpcZoneIdentifierForPurposeAndZones(subnetPurpose,
                     selectedZones)
             String iamInstanceProfile = params.iamInstanceProfile ?: lastLaunchConfig.iamInstanceProfile
             iamInstanceProfile = iamInstanceProfile ?: configService.defaultIamRole
+            log.debug """ClusterController.createNextGroup for Cluster '${cluster.name}' Selected Load Balancers: \
+${loadBalancerNames}"""
+            log.debug """ClusterController.createNextGroup for Cluster '${cluster.name}' Load Balancers from last \
+Group: ${lastGroup.loadBalancerNames}"""
+            boolean ebsOptimized = params.containsKey('ebsOptimized') ? params.ebsOptimized?.toBoolean() :
+                lastLaunchConfig.ebsOptimized
             if (params.noOptionalDefaults != 'true') {
                 securityGroups = securityGroups ?: lastLaunchConfig.securityGroups
                 termPolicies = termPolicies ?: lastGroup.terminationPolicies
                 loadBalancerNames = loadBalancerNames ?: lastGroup.loadBalancerNames
-                vpcZoneIdentifier = vpcZoneIdentifier ?: subnets.constructNewVpcZoneIdentifierForZones(lastGroup.vpcZoneIdentifier,
-                        selectedZones)
+                vpcZoneIdentifier = vpcZoneIdentifier ?: subnets.constructNewVpcZoneIdentifierForZones(
+                        lastGroup.vpcZoneIdentifier, selectedZones)
             }
+            log.debug """ClusterController.createNextGroup for Cluster '${cluster.name}' Load Balancers for next \
+Group: ${loadBalancerNames}"""
             GroupCreateOptions options = new GroupCreateOptions(
                     common: new CommonPushOptions(
                             userContext: userContext,
                             checkHealth: checkHealth,
-                            afterBootWait: params.afterBootWait?.toInteger() ?: 30,
+                            afterBootWait: convertToIntOrUseDefault(params.afterBootWait, 30),
                             appName: appName,
                             env: grailsApplication.config.cloud.accountName,
                             imageId: params.imageId ?: lastLaunchConfig.imageId,
                             instanceType: instanceType,
                             groupName: nextGroupName,
                             securityGroups: securityGroups,
-                            maxStartupRetries: params.maxStartupRetries?.toInteger() ?: 5
+                            maxStartupRetries: convertToIntOrUseDefault(params.maxStartupRetries, 5)
                     ),
                     initialTraffic: initialTraffic,
                     minSize: minSize,
                     desiredCapacity: desiredCapacity,
                     maxSize: maxSize,
-                    defaultCooldown: params.defaultCooldown as Integer ?: lastGroup.defaultCooldown,
+                    defaultCooldown: convertToIntOrUseDefault(params.defaultCooldown, lastGroup.defaultCooldown),
                     healthCheckType: params.healthCheckType ?: lastGroup.healthCheckType.name(),
-                    healthCheckGracePeriod: params.healthCheckGracePeriod as Integer ?: lastGracePeriod,
+                    healthCheckGracePeriod: convertToIntOrUseDefault(params.healthCheckGracePeriod, lastGracePeriod),
                     terminationPolicies: termPolicies,
-                    batchSize: params.batchSize as Integer ?: GroupResizeOperation.DEFAULT_BATCH_SIZE,
+                    batchSize: convertToIntOrUseDefault(params.batchSize, GroupResizeOperation.DEFAULT_BATCH_SIZE),
                     loadBalancerNames: loadBalancerNames,
                     iamInstanceProfile: iamInstanceProfile,
                     keyName: params.keyName ?: lastLaunchConfig.keyName,
@@ -284,7 +290,8 @@ class ClusterController {
                     scalingPolicies: newScalingPolicies,
                     scheduledActions: newScheduledActions,
                     vpcZoneIdentifier: vpcZoneIdentifier,
-                    spotPrice: spotPrice
+                    spotPrice: spotPrice,
+                    ebsOptimized: ebsOptimized
             )
             def operation = pushService.startGroupCreate(options)
             flash.message = "${operation.task.name} has been started."
@@ -292,7 +299,28 @@ class ClusterController {
         }
     }
 
-    def resize = {
+    @VisibleForTesting
+    @PackageScope
+    int convertToIntOrUseDefault(String value, Integer defaultValue) {
+        value?.isInteger() ? value.toInteger() : defaultValue
+    }
+
+    private boolean shouldAzRebalanceBeSuspended(String azRebalance, boolean lastRebalanceSuspended) {
+        (azRebalance == null) ? lastRebalanceSuspended : (azRebalance == 'disabled')
+    }
+
+    private String determineSpotPrice(LaunchConfiguration lastLaunchConfig, UserContext userContext,
+                                      String instanceType) {
+        String spotPrice = null
+        if (!params.pricing) {
+            spotPrice = lastLaunchConfig.spotPrice
+        } else if (params.pricing == InstancePriceType.SPOT.name()) {
+            spotPrice = spotInstanceRequestService.recommendSpotPrice(userContext, instanceType)
+        }
+        spotPrice
+    }
+
+    def resize() {
         UserContext userContext = UserContext.of(request)
         Integer newMin = (params.minSize ?: params.minAndMaxSize) as Integer
         Integer newMax = (params.maxSize ?: params.minAndMaxSize) as Integer
@@ -302,7 +330,7 @@ class ClusterController {
         redirectToTask(operation.taskId)
     }
 
-    def delete = {
+    def delete() {
         UserContext userContext = UserContext.of(request)
         def name = params.name
         AutoScalingGroup group = awsAutoScalingService.getAutoScalingGroup(userContext, name)
@@ -314,34 +342,36 @@ class ClusterController {
         }
     }
 
-    def activate = {
+    def activate() {
         UserContext userContext = UserContext.of(request)
         GroupActivateOperation operation = pushService.startGroupActivate(userContext, params.name)
         redirectToTask(operation.taskId)
     }
 
-    def deactivate = {
+    def deactivate() {
         UserContext userContext = UserContext.of(request)
         GroupDeactivateOperation operation = pushService.startGroupDeactivate(userContext, params.name)
         redirectToTask(operation.taskId)
     }
 
-    def anyInstance = {
+    def anyInstance() {
         UserContext userContext = UserContext.of(request)
         String name = params.id
         String field = params.field
+        if (!name || !field) {
+            response.status = 400
+            if (!name) { render 'name is a required parameter' }
+            if (!field) { render 'field is a required parameter' }
+            return
+        }
         Cluster cluster = awsAutoScalingService.getCluster(userContext, name)
-        List<GroupedInstance> instances = cluster?.instances
-        String instanceId = instances?.size() >= 1 ? instances[0].instanceId : null
-        MergedInstance mergedInstance = instanceId ?
-                mergedInstanceService.getMergedInstancesByIds(userContext, [instanceId])[0] : null
+        List<String> instanceIds = cluster?.instances*.instanceId
+        MergedInstance mergedInstance = mergedInstanceService.findHealthyInstance(userContext, instanceIds)
         String result = mergedInstance?.getFieldValue(field)
         if (!result) {
-            response.status = 400
-            if (!name) { result = 'name is a required parameter'}
-            else if (!field) { result = 'field is a required parameter'}
-            else if (!cluster) { result = "No cluster found with name '$name'"}
-            else if (!mergedInstance) { result = "No instances found for cluster '$name'"}
+            response.status = 404
+            if (!cluster) { result = "No cluster found with name '$name'" }
+            else if (!mergedInstance) { result = "No instances found for cluster '$name'" }
             else { result = "'$field' not found. Valid fields: ${mergedInstance.listFieldNames()}" }
         }
         render result

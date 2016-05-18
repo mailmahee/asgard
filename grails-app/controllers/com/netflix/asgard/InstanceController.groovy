@@ -22,11 +22,9 @@ import com.amazonaws.services.ec2.model.Instance
 import com.amazonaws.services.ec2.model.Reservation
 import com.amazonaws.services.ec2.model.Tag
 import com.amazonaws.services.elasticloadbalancing.model.LoadBalancerDescription
-import com.google.common.collect.Multiset
 import com.netflix.asgard.model.ApplicationInstance
 import com.netflix.asgard.text.TextLink
 import com.netflix.asgard.text.TextLinkTemplate
-import com.netflix.frigga.ami.AppVersion
 import com.netflix.grails.contextParam.ContextParam
 import grails.converters.JSON
 import grails.converters.XML
@@ -34,9 +32,10 @@ import grails.converters.XML
 @ContextParam('region')
 class InstanceController {
 
-    final static allowedMethods = [terminate: 'POST', terminateAndShrinkGroup: 'POST']
+    final static allowedMethods = ['terminate', 'terminateAndShrinkGroup', 'reboot', 'deregister', 'register',
+        'associateDo', 'takeOutOfService', 'putInService', 'addTag', 'removeTag'].collectEntries { [(it): 'POST'] }
 
-    def index = { redirect(action: 'list', params:params) }
+    static editActions = ['associate']
 
     def awsAutoScalingService
     def awsEc2Service
@@ -45,11 +44,35 @@ class InstanceController {
     def discoveryService
     def mergedInstanceGroupingService
 
-    def list = {
+    /**
+     * The special marker for looking for items that do not have an application.
+     */
+    static final String NO_APP_ID = '_noapp'
+
+    def index() {
+        redirect(action: 'list', params: params)
+    }
+
+    def apps() {
+        UserContext userContext = UserContext.of(request)
+        List<MergedInstance> allInstances = mergedInstanceGroupingService.getMergedInstances(userContext)
+        List<String> appNames = allInstances.findResults { it.appName?.toLowerCase() ?: null } as List<String>
+        Map result = [appNames: appNames.unique().sort(), noAppId: NO_APP_ID]
+        withFormat {
+            html { result }
+            xml { new XML(result).render(response) }
+            json { new JSON(result).render(response) }
+        }
+    }
+
+    def list() {
         UserContext userContext = UserContext.of(request)
         List<MergedInstance> instances = []
         Set<String> appNames = Requests.ensureList(params.id).collect { it.split(',') }.flatten() as Set<String>
-        if (appNames) {
+        if (appNames.contains(NO_APP_ID)) {
+            instances = mergedInstanceGroupingService.getMergedInstances(userContext).findAll { !it.appName }
+        }
+        else if (appNames) {
             instances = appNames.collect { mergedInstanceGroupingService.getMergedInstances(userContext, it) }.flatten()
         } else {
             instances = mergedInstanceGroupingService.getMergedInstances(userContext)
@@ -62,7 +85,7 @@ class InstanceController {
         }
     }
 
-    def find = {
+    def find() {
         UserContext userContext = UserContext.of(request)
         String fieldName = params.by
         List<String> fieldValues = Requests.ensureList(params.value).collect { it.split(',') }.flatten()
@@ -79,28 +102,7 @@ class InstanceController {
         }
     }
 
-    def appversions = {
-        UserContext userContext = UserContext.of(request)
-        Set<Multiset.Entry<AppVersion>> avs = awsEc2Service.getCountedAppVersions(userContext).entrySet()
-        withFormat {
-            xml {
-                render() {
-                    apps(count: avs.size()) {
-                        avs.each { Multiset.Entry<AppVersion> entry ->
-                            app(name: entry.element.packageName,
-                                version: entry.element.version,
-                                count: entry.count,
-                                cl: entry.element.changelist,
-                                buildJob: entry.element.buildJobName,
-                                buildNum: entry.element.buildNumber)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    def audit = {
+    def audit() {
         UserContext userContext = UserContext.of(request)
         String filter = params.id
         List<MergedInstance> instances = mergedInstanceGroupingService.getMergedInstances(userContext, '')
@@ -127,7 +129,7 @@ class InstanceController {
         }
     }
 
-    def diagnose = {
+    def diagnose() {
         UserContext userContext = UserContext.of(request)
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId ?: params.id)
         ApplicationInstance appInst = discoveryService.getAppInstance(userContext, instanceId)
@@ -143,7 +145,7 @@ class InstanceController {
     }
 
     /* can show instance info given: instanceId, appName+instanceId, appName+hostName */
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId ?: params.id)
         String appName
@@ -156,7 +158,7 @@ class InstanceController {
             appInst = discoveryService.getAppInstance(userContext, instanceId)
             appName = appInst?.appName
         }
-        Reservation instRsrv = instanceId ? awsEc2Service.getInstanceReservation(userContext, instanceId) : null
+        Reservation instRsrv = awsEc2Service.getInstanceReservation(userContext, instanceId)
         Instance instance = instRsrv ? instRsrv.instances[0] : null
         if (!appInst && !instance) {
             String identifier = instanceId ?: "${params.appName}/${params.hostName}"
@@ -202,18 +204,18 @@ class InstanceController {
         }
     }
 
-    def terminate = {
+    def terminate() {
         UserContext userContext = UserContext.of(request)
         List<String> instanceIds = Requests.ensureList(params.selectedInstances ?: params.instanceId)
 
         // All this deregister-before-terminate logic is complicated because it needs to be done in large batches to
         // reduce Amazon errors. When Amazon fixes their ELB bugs a lot of this code should be removed for simplicity.
-        Map<String, Collection<String>> asgNamesToInstanceIdSets = new HashMap<String, Collection<String>>()
+        Map<String, Collection<String>> asgNamesToInstanceIdSets = [:]
         for (String instanceId in instanceIds) {
             String asg = awsAutoScalingService.getAutoScalingGroupFor(userContext, instanceId)?.autoScalingGroupName
             if (asg) {
                 if (!asgNamesToInstanceIdSets.containsKey(asg)) {
-                    asgNamesToInstanceIdSets.put(asg, new HashSet<String>())
+                    asgNamesToInstanceIdSets.put(asg, [] as Set)
                 }
                 asgNamesToInstanceIdSets[asg].add(instanceId)
             }
@@ -229,7 +231,7 @@ class InstanceController {
         chooseRedirect(params.autoScalingGroupName, instanceIds, params.appNames)
     }
 
-    def terminateAndShrinkGroup = {
+    def terminateAndShrinkGroup() {
         UserContext userContext = UserContext.of(request)
         String instanceId = params.instanceId
         try {
@@ -249,16 +251,17 @@ class InstanceController {
         redirect(action: 'show', params:[instanceId: instanceId])
     }
 
-    def reboot = {
+    def reboot() {
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId)
         UserContext userContext = UserContext.of(request)
         awsEc2Service.rebootInstance(userContext, instanceId)
 
         flash.message = "Rebooting instance '${instanceId}'."
-        redirect(action: 'show', params:[instanceId:instanceId])
+        redirect(action: 'show', params: [instanceId: instanceId])
     }
 
-    def raw = {
+    @SuppressWarnings("ReturnsNullInsteadOfEmptyCollection")
+    def raw_output() {
         UserContext userContext = UserContext.of(request)
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId ?: params.id)
         try {
@@ -273,7 +276,8 @@ class InstanceController {
     private void chooseRedirect(String autoScalingGroupName, List<String> instanceIds, String appName = null) {
         Map destination = [action: 'list']
         if (autoScalingGroupName) {
-            destination = [controller: 'autoScaling', action: 'show', params: [id: autoScalingGroupName, runHealthChecks: true]]
+            destination = [controller: 'autoScaling', action: 'show', params: [id: autoScalingGroupName,
+                    runHealthChecks: true]]
         } else if (instanceIds.size() == 1) {
             destination = [action: 'show', params: [id: instanceIds[0]]]
         } else if (appName) {
@@ -282,14 +286,15 @@ class InstanceController {
         redirect destination
     }
 
-    def deregister = {
+    def deregister() {
         UserContext userContext = UserContext.of(request)
         List<String> instanceIds = Requests.ensureList(params.instanceId)
         String autoScalingGroupName = params.autoScalingGroupName
 
         Set<String> lbNames = new TreeSet<String>()
-        instanceIds.each { instanceId ->
-            lbNames.addAll(awsLoadBalancerService.getLoadBalancersFor(userContext, instanceId).collect { it.loadBalancerName })
+        instanceIds.each { id ->
+            List<LoadBalancerDescription> loadBalancers = awsLoadBalancerService.getLoadBalancersFor(userContext, id)
+            lbNames.addAll(loadBalancers.collect { it.loadBalancerName })
         }
 
         if (lbNames.isEmpty()) {
@@ -302,7 +307,7 @@ class InstanceController {
         chooseRedirect(autoScalingGroupName, instanceIds)
     }
 
-    def register = {
+    def register() {
         UserContext userContext = UserContext.of(request)
         List<String> instanceIds = Requests.ensureList(params.instanceId)
         String autoScalingGroupName = params.autoScalingGroupName
@@ -325,20 +330,21 @@ class InstanceController {
                             "load balancer${elbNames.size() == 1 ? '' : 's'} ${elbNames}"
                 }
             } else {
-                flash.message = "Error: Not all instances '${instanceIds}' are in group '${group?.autoScalingGroupName}'"
+                String groupName = group?.autoScalingGroupName
+                flash.message = "Error: Not all instances '${instanceIds}' are in group '${groupName}'"
             }
         }
 
         chooseRedirect(autoScalingGroupName, instanceIds)
     }
 
-    def associate = {
+    def associate() {
         UserContext userContext = UserContext.of(request)
         Instance instance = awsEc2Service.getInstance(userContext, EntityType.instance.ensurePrefix(params.instanceId))
         if (!instance) {
             flash.message = "EC2 Instance ${params.instanceId} not found."
             redirect(action: 'list')
-            return
+            return []
         } else {
             Map<String, String> publicIps = awsEc2Service.describeAddresses(userContext)
             log.debug "describeAddresses: ${publicIps}"
@@ -350,8 +356,8 @@ class InstanceController {
         }
     }
 
-    def associateDo = {
-        //println "associateDo: ${params}"
+    def associateDo() {
+        log.debug "associateDo: ${params}"
         String publicIp = params.publicIp
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId)
         UserContext userContext = UserContext.of(request)
@@ -361,10 +367,10 @@ class InstanceController {
         } catch (Exception e) {
             flash.message = "Could not associate Elastic IP '${publicIp}' with '${instanceId}': ${e}"
         }
-        redirect(action: 'show', params:[instanceId:instanceId])
+        redirect(action: 'show', params: [instanceId: instanceId])
     }
 
-    def takeOutOfService = {
+    def takeOutOfService() {
         UserContext userContext = UserContext.of(request)
         String autoScalingGroupName = params.autoScalingGroupName
         List<String> instanceIds = Requests.ensureList(params.instanceId)
@@ -373,7 +379,7 @@ class InstanceController {
         chooseRedirect(autoScalingGroupName, instanceIds)
     }
 
-    def putInService = {
+    def putInService() {
         UserContext userContext = UserContext.of(request)
         String autoScalingGroupName = params.autoScalingGroupName
         List<String> instanceIds = Requests.ensureList(params.instanceId)
@@ -382,27 +388,27 @@ class InstanceController {
         chooseRedirect(autoScalingGroupName, instanceIds)
     }
 
-    def addTag = {
+    def addTag() {
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId)
         UserContext userContext = UserContext.of(request)
         awsEc2Service.createInstanceTag(userContext, [instanceId], params.name, params.value)
-        redirect(action: 'show', params:[instanceId:instanceId])
+        redirect(action: 'show', params: [instanceId: instanceId])
     }
 
-    def removeTag = {
+    def removeTag() {
         String instanceId = EntityType.instance.ensurePrefix(params.instanceId)
         UserContext userContext = UserContext.of(request)
         awsEc2Service.deleteInstanceTag(userContext, instanceId, params.name)
-        redirect(action: 'show', params:[instanceId:instanceId])
+        redirect(action: 'show', params: [instanceId: instanceId])
     }
 
-    def userData = {
+    def userData() {
         UserContext userContext = UserContext.of(request)
         String instanceId = EntityType.instance.ensurePrefix(params.id ?: params.instanceId)
         render awsEc2Service.getUserDataForInstance(userContext, instanceId)
     }
 
-    def userDataHtml = {
+    def userDataHtml() {
         UserContext userContext = UserContext.of(request)
         String instanceId = EntityType.instance.ensurePrefix(params.id ?: params.instanceId)
         render "<pre>${awsEc2Service.getUserDataForInstance(userContext, instanceId).encodeAsHTML()}</pre>"

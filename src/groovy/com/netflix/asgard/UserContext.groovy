@@ -15,11 +15,15 @@
  */
 package com.netflix.asgard
 
+import com.fasterxml.jackson.annotation.JsonCreator
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
+import com.fasterxml.jackson.annotation.JsonProperty
 import groovy.transform.Immutable
 import javax.servlet.http.HttpServletRequest
 import org.apache.shiro.SecurityUtils
 import org.apache.shiro.UnavailableSecurityManagerException
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 @Immutable final class UserContext {
 
     /** The unique identifier of the issue tracker ticket for external recording of system changes. */
@@ -42,6 +46,21 @@ import org.apache.shiro.UnavailableSecurityManagerException
      * runs automatically and therefore should not require a tracking code.
      */
     Boolean internalAutomation
+
+    @JsonCreator
+    static UserContext of(@JsonProperty('ticket') String ticket, @JsonProperty('username') String username,
+              @JsonProperty('clientHostName') String clientHostName,
+              @JsonProperty('clientIpAddress') String clientIpAddress,
+              @JsonProperty('region') Region region, @JsonProperty('internalAutomation') Boolean internalAutomation) {
+        new UserContext(
+                ticket: ticket,
+                username: username,
+                clientHostName: clientHostName,
+                clientIpAddress: clientIpAddress,
+                region: region,
+                internalAutomation: internalAutomation
+        )
+    }
 
     /** Factory method takes an HttpServletRequest or a MockHttpServletRequest */
     static of(HttpServletRequest request) {
@@ -67,7 +86,7 @@ import org.apache.shiro.UnavailableSecurityManagerException
      * @param region the AWS region on which the current operation should execute
      * @return UserContext a new context object
      */
-    static auto(Region region) {
+    static auto(Region region = Region.defaultRegion()) {
         new UserContext(region: region, internalAutomation: true)
     }
 

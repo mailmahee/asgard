@@ -16,6 +16,7 @@
 package com.netflix.asgard
 
 import com.amazonaws.services.ec2.model.CancelledSpotInstanceRequest
+import com.amazonaws.services.ec2.model.GroupIdentifier
 import com.amazonaws.services.ec2.model.SpotInstanceRequest
 import com.netflix.asgard.model.SpotInstanceRequestListType
 import com.netflix.grails.contextParam.ContextParam
@@ -30,9 +31,11 @@ class SpotInstanceRequestController {
 
     final static allowedMethods = [cancel: 'POST']
 
-    def index = { redirect(action: 'list', params: params) }
+    def index() {
+        redirect(action: 'list', params: params)
+    }
 
-    def list = {
+    def list() {
         UserContext userContext = UserContext.of(request)
         SpotInstanceRequestListType type = SpotInstanceRequestListType.of(params.type)
         List<SpotInstanceRequest> sirs = spotInstanceRequestService.getSpotInstanceRequests(userContext, type)
@@ -44,11 +47,13 @@ class SpotInstanceRequestController {
         }
     }
 
-    def show = {
+    def show() {
         UserContext userContext = UserContext.of(request)
         String spotInstanceRequestId = params.id
         SpotInstanceRequest sir = spotInstanceRequestService.getSpotInstanceRequest(userContext, spotInstanceRequestId)
-        Map details = [spotInstanceRequest: sir]
+        List<GroupIdentifier> securityGroups = awsEc2Service.getSecurityGroupNameIdPairsByNamesOrIds(userContext,
+                sir.launchSpecification.securityGroups)
+        Map details = [spotInstanceRequest: sir, securityGroups: securityGroups]
         withFormat {
             html { details }
             xml { new XML(details).render(response) }
@@ -56,7 +61,7 @@ class SpotInstanceRequestController {
         }
     }
 
-    def cancel = {
+    def cancel() {
         UserContext userContext = UserContext.of(request)
         List<String> sirIds = Requests.ensureList(params.selectedSpotInstanceRequests ?: params.spotInstanceRequestId)
         List<CancelledSpotInstanceRequest> cancelledSirs = spotInstanceRequestService.cancelSpotInstanceRequests(
@@ -65,6 +70,8 @@ class SpotInstanceRequestController {
         redirect(action: 'result')
     }
 
-    def result = { render view: '/common/result' }
+    def result() {
+        render view: '/common/result'
+    }
 
 }

@@ -15,7 +15,7 @@
  */
 package com.netflix.asgard.auth
 
-import com.netflix.asgard.mock.ShiroTestUtil
+import org.apache.shiro.SecurityUtils
 import org.apache.shiro.subject.Subject
 import org.joda.time.DateTime
 import spock.lang.Specification
@@ -25,11 +25,7 @@ class ApiTokenSpec extends Specification {
     def setup() {
         Subject subject = Mock(Subject)
         subject.principal >> 'testUser@netflix.com'
-        ShiroTestUtil.setSubject(subject)
-    }
-
-    def cleanup() {
-        ShiroTestUtil.tearDownShiro()
+        SecurityUtils.metaClass.static.getSubject = { subject }
     }
 
     def 'should generate and parse a key correctly'() {
@@ -44,11 +40,11 @@ class ApiTokenSpec extends Specification {
         tokens[0] == 'TestScript'
         ApiToken.TOKEN_DATE_FORMAT.parseDateTime(tokens[1]) == new DateTime().plusDays(30).withMillisOfDay(0)
         tokens[2] == 'testUser@netflix.com'
-        tokens[3] ==~ /[a-zA-Z0-9\+\/]{8}/
+        tokens[3] ==~ /[a-zA-Z0-9\%]{8,24}/
         tokens[4] == 'testDL@netflix.com'
 
         when:
-        ApiToken parsedToken = ApiToken.fromApiTokenString(tokenString)
+        ApiToken parsedToken = ApiToken.fromApiTokenString(URLDecoder.decode(tokenString))
 
         then:
         parsedToken.isValid('key')
@@ -66,10 +62,10 @@ class ApiTokenSpec extends Specification {
         tokens[0] == 'TestScript'
         ApiToken.TOKEN_DATE_FORMAT.parseDateTime(tokens[1]) == new DateTime().plusDays(30).withMillisOfDay(0)
         tokens[2] == 'testUser@netflix.com'
-        tokens[3] ==~ /[a-zA-Z0-9\+\/]{8}/
+        tokens[3] ==~ /[a-zA-Z0-9\%]{8,24}/
 
         when:
-        ApiToken parsedToken = ApiToken.fromApiTokenString(tokenString)
+        ApiToken parsedToken = ApiToken.fromApiTokenString(URLDecoder.decode(tokenString))
 
         then:
         parsedToken.isValid('key')
@@ -79,7 +75,7 @@ class ApiTokenSpec extends Specification {
         String semiEternalToken = 'TestScript:2833-12-20:testUser@netflix.com:xh20q18Y:testDL@netflix.com'
 
         when:
-        ApiToken parsedToken = ApiToken.fromApiTokenString(semiEternalToken)
+        ApiToken parsedToken = ApiToken.fromApiTokenString(URLDecoder.decode(semiEternalToken))
 
         then:
         parsedToken.isValid('key')

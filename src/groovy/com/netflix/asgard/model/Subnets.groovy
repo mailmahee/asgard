@@ -1,48 +1,68 @@
 /*
- * Copyright 2010-2012 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+ * Copyright 2013 Netflix, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License").
- * You may not use this file except in compliance with the License.
- * A copy of the License is located at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *  http://aws.amazon.com/apache2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * or in the "license" file accompanying this file. This file is distributed
- * on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either
- * express or implied. See the License for the specific language governing
- * permissions and limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 package com.netflix.asgard.model
 
 import com.amazonaws.services.ec2.model.Subnet
 import com.google.common.base.Function
 import com.google.common.base.Supplier
+import com.google.common.collect.ImmutableSet
 import com.google.common.collect.Maps
 import com.google.common.collect.Multimap
 import com.google.common.collect.Multimaps
 import com.netflix.asgard.Check
 import com.netflix.asgard.Relationships
-import groovy.transform.Immutable
+import groovy.transform.Canonical
 
 /**
  * These are nontrivial queries we like to perform on subnets.
  */
-@Immutable class Subnets {
+@Canonical class Subnets {
     /** All of the subnets contained in this object. */
-    Collection<SubnetData> allSubnets
+    final Collection<SubnetData> allSubnets
 
-    /**
-     * Construct Subnets from AWS Subnets
-     *
-     * @param  subnets the actual AWS Subnets
-     * @return a new immutable Subnets based off the subnets
-     */
-    public static Subnets from(Collection<Subnet> subnets) {
-        new Subnets(allSubnets: subnets.collect() { SubnetData.from(it) })
+    /** The identifier of the default VPC of the account-region, if available. */
+    final String defaultVpcId
+
+    private Subnets(Collection<SubnetData> allSubnets, String defaultVpcId = null) {
+        this.defaultVpcId = defaultVpcId
+        this.allSubnets = ImmutableSet.copyOf(allSubnets)
     }
 
     /**
-     * Simply find a subnet based on its ID.
+     * Constructs Subnets from AWS Subnets.
+     *
+     * @param subnets the actual AWS Subnets
+     * @param defaultVpcId the identifier of the default VPC, if available
+     * @return a new immutable Subnets based off the subnets
+     */
+    public static Subnets from(Collection<Subnet> subnets, String defaultVpcId = null) {
+        new Subnets(subnets.collect() { SubnetData.from(it) }, defaultVpcId)
+    }
+
+    /**
+     * Gets the identifiers of all the subnets in this set.
+     *
+     * @return the subnet ID strings
+     */
+    List<String> getSubnetIds() {
+        allSubnets*.subnetId
+    }
+
+    /**
+     * Simply finds a subnet based on its ID.
      *
      * @param id of the subnet
      * @return the unique subnet with that ID or null
@@ -53,7 +73,18 @@ import groovy.transform.Immutable
     }
 
     /**
-     * Find the subnet associated with the first Subnet ID. This is useful in cases where the attribute you care about
+     * Finds all subnets in a given VPC.
+     *
+     * @param vpcId id of the VPC the subnet belongs to
+     * @return wrapped set of SubnetData representations of subnets associated with the specified VPC
+     */
+    Subnets findSubnetsByVpc(String vpcId) {
+        Check.notNull(vpcId, String)
+        new Subnets(allSubnets.findAll { it.vpcId == vpcId })
+    }
+
+    /**
+     * Finds the subnet associated with the first Subnet ID. This is useful in cases where the attribute you care about
      * is guaranteed to be the same for all subnets.
      *
      * @param  subnetIds Subnet IDs
@@ -64,7 +95,19 @@ import groovy.transform.Immutable
     }
 
     /**
-     * Find the subnet IDs that map to specific zones
+     * Finds the identifier of the VPC indicated by the specified VPC Zone Identifier string.
+     *
+     * @param vpcZoneIdentifier the comma-delimited list of subnet IDs used in an ASG field as a roundabout way of
+     *      indicating which VPC where the ASG launches instances
+     * @return the identifier of the VPC where the subnets exist if available, or the default VPC if available, or null
+     */
+    String getVpcIdForVpcZoneIdentifier(String vpcZoneIdentifier) {
+        List<String> subnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(vpcZoneIdentifier)
+        coerceLoneOrNoneFromIds(subnetIds)?.vpcId ?: defaultVpcId
+    }
+
+    /**
+     * Finds the subnet IDs that map to specific zones
      *
      * @param  zones the zones in AWS that you want Subnet IDs for
      * @param  purpose only subnets with the specified purpose will be returned
@@ -72,7 +115,7 @@ import groovy.transform.Immutable
      * @return the subnet IDs returned in the same order as the zones sent in or an empty List
      * @throws IllegalArgumentException if there are multiple subnets with the same purpose and zone
      */
-    List<String> getSubnetIdsForZones(List<String> zones, String purpose, SubnetTarget target = null) {
+    List<String> getSubnetIdsForZones(Collection<String> zones, String purpose, SubnetTarget target = null) {
         if (!zones) {
             return Collections.emptyList()
         }
@@ -85,11 +128,11 @@ import groovy.transform.Immutable
             }
             SubnetData subnetForPurpose = Maps.uniqueIndex(subnetsForZone, purposeOfSubnet)[purpose]
             subnetForPurpose?.subnetId
-        }.findAll { it != null}
+        }.findAll { it != null }
     }
 
     /**
-     * Group zones by subnet purposes they contain.
+     * Groups zones by subnet purposes they contain.
      *
      * @param  allAvailabilityZones complete list of zones to group
      * @param  target is the type of AWS object the subnet applies to (null means any object type)
@@ -111,7 +154,7 @@ import groovy.transform.Immutable
     }
 
     /**
-     * Find all purposes across all specified zones for the specified target.
+     * Finds all purposes across all specified zones for the specified target.
      *
      * @param  zones the zones in AWS that you want purposes for
      * @param  target is the type of AWS object the subnet applies to (null means any object type)
@@ -136,16 +179,31 @@ import groovy.transform.Immutable
     }
 
     /**
+     * Finds a matching VPC identifier for the specified purpose, or null if there is no VPC ID match for that purpose.
+     * If the purpose is null or an empty string, this method looks for default VPC ID if available.
+     *
+     * @param subnetPurpose the name of the purpose of the VPC
+     * @return the identifier of the VPC that has the specified purpose, or the ID of the default VPC if the purpose
+     *          specified is null or an empty string, or null if no matching VPC exists
+     */
+    String getVpcIdForSubnetPurpose(String subnetPurpose) {
+        mapPurposeToVpcId()[subnetPurpose ?: null]
+    }
+
+    /**
      * Provides a one to one mapping from a Subnet purpose to its VPC ID. Purposes that span VPCs in the same region
      * are invalid and will be left out of the map.
      *
      * @return map of subnet purposes to their VPC ID
      */
     Map<String, String> mapPurposeToVpcId() {
-        Map<Object, List<SubnetData>> subnetsGroupedByPurpose = allSubnets.groupBy { it.purpose }
+        Map<String, List<SubnetData>> subnetsGroupedByPurpose = allSubnets.groupBy { it.purpose }
         subnetsGroupedByPurpose.inject([:]) { Map purposeToVpcId, Map.Entry entry ->
             String purpose = entry.key
             if (!purpose) {
+                if (defaultVpcId) {
+                    purposeToVpcId[null] = defaultVpcId
+                }
                 return purposeToVpcId
             }
             List<SubnetData> subnets = entry.value as List
@@ -160,7 +218,7 @@ import groovy.transform.Immutable
     }
 
     /**
-     * Construct a new VPC Zone Identifier based on an existing VPC Zone Identifier and a list of zones.
+     * Constructs a new VPC Zone Identifier based on an existing VPC Zone Identifier and a list of zones.
      * A VPC Zone Identifier is really just a comma delimited list of subnet IDs.
      * I'm not happy that this method has to exist. It's just a wrapper around other methods that operate on a cleaner
      * abstraction without knowledge of the unfortunate structure of VPC Zone Identifier.
@@ -174,19 +232,30 @@ import groovy.transform.Immutable
             // No zones were selected because there was no chance to change them. Keep the VPC Zone Identifier.
             return vpcZoneIdentifier
         }
-        List<String> oldSubnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(vpcZoneIdentifier)
-        String purpose = coerceLoneOrNoneFromIds(oldSubnetIds)?.purpose
+        String purpose = getPurposeFromVpcZoneIdentifier(vpcZoneIdentifier)
         constructNewVpcZoneIdentifierForPurposeAndZones(purpose, zones)
     }
 
     /**
-     * Construct a new VPC Zone Identifier based on a subnet purpose and a list of zones.
+     * Figures out the subnet purpose given a VPC zone identifier.
+     *
+     * @param  vpcZoneIdentifier is used to derive a subnet purpose from
+     * @return the subnet purpose indicated by the vpcZoneIdentifier
+     */
+    String getPurposeFromVpcZoneIdentifier(String vpcZoneIdentifier) {
+        List<String> oldSubnetIds = Relationships.subnetIdsFromVpcZoneIdentifier(vpcZoneIdentifier)
+        // All subnets used in the vpcZoneIdentifier will have the same subnet purpose if set up in Asgard.
+        coerceLoneOrNoneFromIds(oldSubnetIds)?.purpose
+    }
+
+    /**
+     * Constructs a new VPC Zone Identifier based on a subnet purpose and a list of zones.
      *
      * @param  purpose is used to derive a subnet purpose from
      * @param  zones which the new VPC Zone Identifier will contain
      * @return a new VPC Zone Identifier or null if no purpose was specified
      */
-    String constructNewVpcZoneIdentifierForPurposeAndZones(String purpose, List<String> zones) {
+    String constructNewVpcZoneIdentifierForPurposeAndZones(String purpose, Collection<String> zones) {
         if (purpose) {
             List<String> newSubnetIds = getSubnetIdsForZones(zones, purpose, SubnetTarget.EC2) // This is only for ASGs.
             if (newSubnetIds) {

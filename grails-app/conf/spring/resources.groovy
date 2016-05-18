@@ -13,15 +13,31 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.google.common.base.CaseFormat
 import com.netflix.asgard.CachedMapBuilder
 import com.netflix.asgard.Caches
-import com.netflix.asgard.DefaultUserDataProvider
+import com.netflix.asgard.CsiAsgAnalyzer
+import com.netflix.asgard.applications.SimpleDBApplicationService
+import com.netflix.asgard.applications.SpinnakerApplicationService
+import com.netflix.asgard.NoOpAsgAnalyzer
 import com.netflix.asgard.Region
 import com.netflix.asgard.ServiceInitLoggingBeanPostProcessor
 import com.netflix.asgard.SnsTaskFinishedListener
 import com.netflix.asgard.ThreadScheduler
 import com.netflix.asgard.auth.OneLoginAuthenticationProvider
+import com.netflix.asgard.auth.RestrictBrowserAuthorizationProvider
+import com.netflix.asgard.auth.RestrictEditAuthorizationProvider
+import com.netflix.asgard.deployment.DeploymentActivitiesImpl
+import com.netflix.asgard.eureka.EurekaClientHolder
+import com.netflix.asgard.model.CsiScheduledAnalysisFactory
+import com.netflix.asgard.server.DeprecatedServerNames
+import com.netflix.asgard.userdata.DefaultAdvancedUserDataProvider
+import com.netflix.asgard.userdata.DefaultUserDataProvider
+import com.netflix.asgard.userdata.LocalFileUserDataProvider
+import com.netflix.asgard.userdata.NetflixAdvancedUserDataProvider
+import com.netflix.asgard.userdata.PropertiesUserDataProvider
 import groovy.io.FileType
 
 beans = {
@@ -34,9 +50,36 @@ beans = {
 
     caches(Caches, ref('cachedMapBuilder'), ref('configService'))
 
+    deprecatedServerNames(DeprecatedServerNames) {
+        it.autowire = "byName"
+    }
+
+    eurekaClientHolder(EurekaClientHolder) {
+        it.autowire = "byName"
+    }
+
+    objectMapper(ObjectMapper)
+
+    propertiesUserDataProvider(PropertiesUserDataProvider) { bean ->
+        bean.lazyInit = true
+    }
+
     defaultUserDataProvider(DefaultUserDataProvider) { bean ->
         bean.lazyInit = true
     }
+
+    defaultAdvancedUserDataProvider(DefaultAdvancedUserDataProvider) { bean ->
+        bean.lazyInit = true
+    }
+
+    noOpAsgAnalyzer(NoOpAsgAnalyzer)
+
+    deploymentActivitiesImpl(DeploymentActivitiesImpl) {
+        it.autowire = "byName"
+        it.lazyInit = true
+    }
+
+    csiScheduledAnalysisFactory(CsiScheduledAnalysisFactory)
 
     snsTaskFinishedListener(SnsTaskFinishedListener) { bean ->
         bean.lazyInit = true
@@ -47,6 +90,45 @@ beans = {
             bean.lazyInit = true
         }
     }
+
+    if (application.config.plugin?.userDataProvider == 'localFileUserDataProvider') {
+      localFileUserDataProvider(LocalFileUserDataProvider) { bean ->
+        bean.lazyInit = true
+      }
+    }
+
+    if (application.config.plugin?.advancedUserDataProvider == 'netflixAdvancedUserDataProvider') {
+        netflixAdvancedUserDataProvider(NetflixAdvancedUserDataProvider) { bean ->
+            bean.lazyInit = true
+        }
+    }
+
+    if (application.config.plugin?.asgAnalyzer == 'csiAsgAnalyzer') {
+        csiAsgAnalyzer(CsiAsgAnalyzer) { bean ->
+            bean.lazyInit = true
+        }
+    }
+
+    restrictEditAuthorizationProvider(RestrictEditAuthorizationProvider) { bean ->
+        bean.lazyInit = true
+    }
+
+    restrictBrowserAuthorizationProvider(RestrictBrowserAuthorizationProvider)
+
+    if (application.config.spinnaker?.gateUrl) {
+        applicationService(
+            SpinnakerApplicationService,
+            application.config.spinnaker.gateUrl as String,
+            application.config.cloud.accountName as String
+        ) { bean ->
+            bean.lazyInit = true
+        }
+    } else {
+        applicationService(SimpleDBApplicationService) { bean ->
+            bean.lazyInit = true
+        }
+    }
+
 
     //**** Plugin behavior
 

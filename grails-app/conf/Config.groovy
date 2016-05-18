@@ -13,9 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 import com.netflix.asgard.model.HardwareProfile
 import com.netflix.asgard.model.InstanceTypeData
 import org.apache.log4j.DailyRollingFileAppender
+
 
 // http://grails.org/doc/latest/guide/3.%20Configuration.html#3.1.2 Logging
 log4j = {
@@ -29,6 +31,9 @@ log4j = {
                 file: "${logDirectory}/asgard.log",
                 layout: pattern(conversionPattern: '[%d{ISO8601}] [%t] %c{4}    %m%n'),
                 datePattern: "'.'yyyy-MM-dd")
+
+        rollingFile name: "stacktrace", maxFileSize: 1024,
+                file: "${logDirectory}/stacktrace.log"
     }
 
     root {
@@ -50,6 +55,10 @@ log4j = {
     // Set for a specific service
     debug "grails.app.service.com.netflix.asgard.ServerService"
 
+    // Debug issue with occasional missing ELBs when creating the next ASG in a cluster.
+    debug 'com.netflix.asgard.ClusterController'
+    debug 'com.netflix.asgard.push.GroupCreateOperation'
+
     warn 'org.codehaus.groovy.grails'
 
     // Set this to debug to watch the XML communications to and from Amazon
@@ -57,16 +66,21 @@ log4j = {
 
     // Suppress most noise from libraries
     error 'com.amazonaws', 'grails.spring', 'net.sf.ehcache', 'org.springframework', 'org.hibernate',
-            'org.apache.catalina', 'org.apache.commons', 'org.apache.coyote', 'org.apache.jasper', 'org.apache.tomcat',
-            'org.codehaus.groovy.grails'
+            'org.apache.catalina', 'org.apache.commons', 'org.apache.coyote', 'org.apache.http.client.protocol',
+            'org.apache.jasper', 'org.apache.tomcat', 'org.codehaus.groovy.grails'
+
+    // Avoid odd extra log4j error message during grails test-app initialization
+    error 'com.amazonaws.services.simpleworkflow.flow.worker.DecisionTaskPoller'
 
     environments {
-        development {
+        def devConfig = {
             console name: 'stdout', layout: pattern(conversionPattern: '[%d{ISO8601}] %c{4}    %m%n')
             root {
                 info 'stdout'
             }
         }
+        development devConfig
+        mcetestLocalDev devConfig
     }
 }
 
@@ -119,6 +133,8 @@ grails.enable.native2ascii = true
 
 grails.exceptionresolver.params.exclude = ['password', 'j_password']
 
+grails.databinding.convertEmptyStringsToNull = false
+
 thread {
     useJitter = true
 }
@@ -128,22 +144,10 @@ cloud {
 
     throttleMillis = 400
 
-    // TODO: Delete these instance type hacks as soon as m3.xlarge, m3.2xlarge are in the AWS Java SDK enum instead
-    customInstanceTypes = [
-            new InstanceTypeData(linuxOnDemandPrice: 0.580, hardwareProfile:
-                    new HardwareProfile(instanceType: 'm3.xlarge', architecture: '64-bit',
-                            cpu: '13 EC2 Compute Units (4 virtual cores with 3.25 EC2 Compute Units each)',
-                            description: 'M3 Extra Large Instance',
-                            ioPerformance: 'Moderate', memory: '15 GiB',
-                            storage: 'EBS storage only')),
-            new InstanceTypeData(linuxOnDemandPrice: 1.160, hardwareProfile:
-                    new HardwareProfile(instanceType: 'm3.2xlarge', architecture: '64-bit',
-                            cpu: '26 EC2 Compute Units (8 virtual cores with 3.25 EC2 Compute Units each)',
-                            description: 'M3 Double Extra Large Instance',
-                            ioPerformance: 'High', memory: '30 GiB',
-                            storage: 'EBS storage only')),
-    ]
+    spot.infoUrl = 'http://aws.amazon.com/ec2/spot-instances/'
 }
+
+cors.allow.origin.regex = '$.^' // Disable CORS support by default
 
 healthCheck {
     minimumCounts {
@@ -173,18 +177,26 @@ ticket {
 
 server {
     online = true
+    otherServerNamePortCombos = System.getProperty('otherServers')?.split(',') ?: []
 }
 
 environments {
     development {
         server.online = !System.getProperty('offline')
-        if (!server.online) { println 'Config: working offline' }
+        if (!server.online) {
+            println 'Config: working offline'
+        }
         plugin {
             refreshDelay = 5000
         }
+        workflow.taskList = "asgard_${System.getProperty('user.name')}"
     }
     test {
-        server.online = false
+        if (System.getProperty('regressionSuite') == 'true') {
+            server.online = true
+        } else {
+            server.online = false
+        }
     }
     production {
         cloud {

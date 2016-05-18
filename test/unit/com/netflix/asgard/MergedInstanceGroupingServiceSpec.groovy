@@ -16,7 +16,6 @@
 package com.netflix.asgard
 
 import com.amazonaws.services.ec2.model.Instance
-import com.netflix.asgard.mock.Mocks
 import com.netflix.asgard.model.ApplicationInstance
 import spock.lang.Specification
 
@@ -35,9 +34,9 @@ class MergedInstanceGroupingServiceSpec extends Specification {
 
     Instance instance = new Instance(instanceId: INSTANCE_ID)
     Instance instance2 = new Instance(instanceId: INSTANCE_ID2)
-    ApplicationInstance appInstance = new ApplicationInstance([:])
-    ApplicationInstance appInstance2 = new ApplicationInstance([:])
-    UserContext userContext = Mocks.userContext()
+    ApplicationInstance appInstance = new ApplicationInstance()
+    ApplicationInstance appInstance2 = new ApplicationInstance()
+    UserContext userContext = UserContext.auto()
 
     def 'should create merged instances with ec2 and discovery instance'() {
         appInstance.instanceId = INSTANCE_ID
@@ -86,7 +85,7 @@ class MergedInstanceGroupingServiceSpec extends Specification {
 
     def 'should create merged instance when app specified'() {
         appInstance.instanceId = INSTANCE_ID
-        discoveryService.getAppInstances(userContext, 'appName', From.CACHE) >> [appInstance]
+        discoveryService.getAppInstances(userContext, 'appName') >> [appInstance]
         awsEc2Service.getInstance(userContext, INSTANCE_ID, From.CACHE) >> instance
 
         when:
